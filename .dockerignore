@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.venv/
+venv/
+dist/
+build/
+.git/
+.gitignore
+.DS_Store
+*.sqlite3
+weights/
+gfpgan/weights/

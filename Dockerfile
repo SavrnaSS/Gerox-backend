@@ -1,35 +1,35 @@
 FROM python:3.10-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 # ===============================
-# System dependencies (CPU only)
+# System deps (needed to build insightface extensions)
 # ===============================
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    make \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     cmake \
+    pkg-config \
     libgl1 \
     libglib2.0-0 \
     curl \
     wget \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # ===============================
-# Python deps (NO insightface)
+# Python deps
 # ===============================
 COPY requirements.txt .
 RUN pip install --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+ && pip install -r requirements.txt
 
 # ===============================
-# Install insightface (FORCE WHEEL)
+# Install insightface (CPU build)
 # ===============================
-RUN pip install \
-    --no-build-isolation \
-    --only-binary=:all: \
-    insightface==0.7.3
+RUN pip install --no-cache-dir --no-build-isolation insightface==0.7.3
 
 # ===============================
 # Model directories
@@ -55,5 +55,5 @@ RUN wget -O /app/gfpgan/weights/parsing_parsenet.pth \
 # ===============================
 COPY . .
 
-EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Railway provides PORT env var
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

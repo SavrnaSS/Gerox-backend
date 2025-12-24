@@ -4,13 +4,9 @@ python-multipart
 aiofiles
 pydantic
 requests
-
-# Imaging
 pillow
-opencv-python-headless==4.8.1.78
 
-# Math
+opencv-python-headless==4.8.1.78
 numpy<2
 
-# ONNX Runtime (CPU only)
 onnxruntime==1.16.3
