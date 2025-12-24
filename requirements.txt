@@ -1,18 +1,25 @@
-fastapi
-uvicorn[standard]
-python-multipart
-pillow
-aiofiles
-pydantic
+# ===============================
+# Core API
+# ===============================
+fastapi==0.127.0
+uvicorn[standard]==0.40.0
+python-multipart==0.0.21
+aiofiles==25.1.0
+requests==2.32.5
+
+# ===============================
+# Data & Validation
+# ===============================
+pydantic==2.12.5
+
+# ===============================
+# Image / CV
+# ===============================
+pillow==12.0.0
 opencv-python-headless==4.8.1.78
 numpy<2
-# InsightFace (CPU)
-insightface==0.7.3
 
+# ===============================
 # ONNX Runtime (CPU ONLY)
+# ===============================
 onnxruntime==1.16.3
-
-# Utils
-pillow
-requests
-

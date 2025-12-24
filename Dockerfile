@@ -1,7 +1,7 @@
 FROM python:3.10
 
 # ===============================
-# System dependencies
+# System dependencies (FULL)
 # ===============================
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # ===============================
-# Python deps (WITHOUT insightface)
+# Python deps (NO insightface here)
 # ===============================
 COPY requirements.txt .
 RUN pip install --upgrade pip \
@@ -30,12 +30,12 @@ RUN pip install --upgrade pip \
 RUN pip install --no-build-isolation --prefer-binary insightface==0.7.3
 
 # ===============================
-# Model directories
+# Create model directories
 # ===============================
 RUN mkdir -p /app/weights /app/gfpgan/weights
 
 # ===============================
-# Download models
+# Download models at build time
 # ===============================
 RUN wget -O /app/weights/GFPGANv1.4.pth \
     https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
@@ -49,7 +49,7 @@ RUN wget -O /app/gfpgan/weights/parsing_parsenet.pth \
     https://github.com/xinntao/facexlib/releases/download/v0.2.0/detection_Resnet50_Final.pth
 
 # ===============================
-# App code
+# Copy app code
 # ===============================
 COPY . .
 
