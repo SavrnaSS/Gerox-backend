@@ -1,41 +1,42 @@
-FROM python:3.10
+FROM python:3.10-slim
 
 # ===============================
-# System dependencies (FULL)
+# System dependencies (CRITICAL)
 # ===============================
 RUN apt-get update && apt-get install -y \
+    g++ \
     build-essential \
     cmake \
-    gfortran \
-    libopenblas-dev \
-    liblapack-dev \
     libgl1 \
     libglib2.0-0 \
     curl \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+# ===============================
+# App directory
+# ===============================
 WORKDIR /app
 
 # ===============================
-# Python deps (NO insightface here)
+# Python deps (NO insightface)
 # ===============================
 COPY requirements.txt .
 RUN pip install --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 # ===============================
-# Install insightface SAFELY
+# Install insightface (SAFE MODE)
 # ===============================
 RUN pip install --no-build-isolation --prefer-binary insightface==0.7.3
 
 # ===============================
-# Create model directories
+# Model directories
 # ===============================
 RUN mkdir -p /app/weights /app/gfpgan/weights
 
 # ===============================
-# Download models at build time
+# Download models
 # ===============================
 RUN wget -O /app/weights/GFPGANv1.4.pth \
     https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
@@ -49,7 +50,7 @@ RUN wget -O /app/gfpgan/weights/parsing_parsenet.pth \
     https://github.com/xinntao/facexlib/releases/download/v0.2.0/detection_Resnet50_Final.pth
 
 # ===============================
-# Copy app code
+# App code
 # ===============================
 COPY . .
 
