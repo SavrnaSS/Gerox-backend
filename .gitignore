@@ -1,18 +1,10 @@
-# env files
-.env
-.env.local
-.env.*
-.env.production
-.env.development
-
-# python
+.venv/
 __pycache__/
 *.pyc
-venv/
 
-# node
-node_modules/
-
-# outputs / temp
-output/
-profile/
+# model weights
+*.pth
+*.pt
+*.onnx
+weights/
+gfpgan/weights/
