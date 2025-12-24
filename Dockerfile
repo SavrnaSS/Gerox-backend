@@ -1,11 +1,12 @@
 FROM python:3.10-slim
 
 # ===============================
-# System dependencies (CRITICAL)
+# System dependencies (CPU only)
 # ===============================
 RUN apt-get update && apt-get install -y \
+    gcc \
     g++ \
-    build-essential \
+    make \
     cmake \
     libgl1 \
     libglib2.0-0 \
@@ -13,9 +14,6 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# ===============================
-# App directory
-# ===============================
 WORKDIR /app
 
 # ===============================
@@ -26,9 +24,12 @@ RUN pip install --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 # ===============================
-# Install insightface (SAFE MODE)
+# Install insightface (FORCE WHEEL)
 # ===============================
-RUN pip install --no-build-isolation --prefer-binary insightface==0.7.3
+RUN pip install \
+    --no-build-isolation \
+    --only-binary=:all: \
+    insightface==0.7.3
 
 # ===============================
 # Model directories
@@ -55,4 +56,4 @@ RUN wget -O /app/gfpgan/weights/parsing_parsenet.pth \
 COPY . .
 
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
