@@ -1,11 +1,14 @@
 FROM python:3.10
 
 # ===============================
-# System dependencies
+# System dependencies (FULL)
 # ===============================
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
+    gfortran \
+    libopenblas-dev \
+    liblapack-dev \
     libgl1 \
     libglib2.0-0 \
     curl \
@@ -30,7 +33,7 @@ RUN pip install --upgrade pip \
 RUN mkdir -p /app/weights /app/gfpgan/weights
 
 # ===============================
-# Download AI models (runtime-safe)
+# Download AI models
 # ===============================
 RUN wget -O /app/weights/GFPGANv1.4.pth \
     https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
