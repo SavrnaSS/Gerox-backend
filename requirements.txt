@@ -1,0 +1,18 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+aiofiles
+pydantic
+opencv-python-headless==4.8.1.78
+numpy<2
+# InsightFace (CPU)
+insightface==0.7.3
+
+# ONNX Runtime (CPU ONLY)
+onnxruntime==1.16.3
+
+# Utils
+pillow
+requests
+
