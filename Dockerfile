@@ -5,31 +5,36 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 # ===============================
-# System deps (needed to build insightface extensions)
+# System deps (opencv/insightface runtime + build tools)
 # ===============================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     pkg-config \
-    libgl1 \
-    libglib2.0-0 \
+    git \
     curl \
     wget \
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # ===============================
-# Python deps
+# Python deps (install first for caching)
 # ===============================
 COPY requirements.txt .
-RUN pip install --upgrade pip \
- && pip install -r requirements.txt
 
-# ===============================
-# Install insightface (CPU build)
-# ===============================
-RUN pip install --no-cache-dir --no-build-isolation insightface==0.7.3
+RUN pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.txt
+
+# ✅ Do NOT reinstall insightface separately if it's already in requirements.txt.
+# If you still want to force it, keep it here, but it’s better to pin in requirements.txt.
+# RUN pip install --no-cache-dir --no-build-isolation insightface==0.7.3
 
 # ===============================
 # Model directories
@@ -37,7 +42,7 @@ RUN pip install --no-cache-dir --no-build-isolation insightface==0.7.3
 RUN mkdir -p /app/weights /app/gfpgan/weights
 
 # ===============================
-# Download models
+# Download models (GFPGAN / RealESRGAN / FaceXLib parsing+detection)
 # ===============================
 RUN wget -O /app/weights/GFPGANv1.4.pth \
     https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
@@ -56,4 +61,4 @@ RUN wget -O /app/gfpgan/weights/parsing_parsenet.pth \
 COPY . .
 
 # Railway provides PORT env var
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["bash", "-lc", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
