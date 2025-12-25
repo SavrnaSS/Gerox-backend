@@ -1,4 +1,3 @@
-# main.py (FULL updated file — keeps your working logic + fixes UI by returning R2 URLs when available)
 print("\n🚨 BACKEND STARTED – EMBEDDING MATCH MODE 🚨")
 
 import warnings
@@ -12,6 +11,7 @@ import imghdr
 import traceback
 from pathlib import Path
 import threading
+from typing import Optional
 
 import requests
 from PIL import Image
@@ -44,7 +44,13 @@ from nano_banana_fallback import (
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
-MIN_SIMILARITY = 0.20
+MIN_SIMILARITY = float(os.getenv("MIN_SIMILARITY", "0.20"))
+
+# If 1, sync full theme folder from R2 at request time (can be heavy).
+SYNC_FULL_THEME_FROM_R2 = os.getenv("SYNC_FULL_THEME_FROM_R2", "0") == "1"
+
+# If 1, also return base64 even when R2 is enabled (useful for local dev / debugging).
+ALSO_RETURN_BASE64 = os.getenv("ALSO_RETURN_BASE64", "0") == "1"
 
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
@@ -59,6 +65,8 @@ print("📁 PUBLIC_DIR:", PUBLIC_DIR)
 print("📁 THEMES_ROOT:", THEMES_ROOT)
 print("📁 UPLOAD_DIR:", UPLOAD_DIR)
 print("☁️ R2_ENABLED:", getattr(r2_storage, "R2_ENABLED", False))
+print("☁️ SYNC_FULL_THEME_FROM_R2:", SYNC_FULL_THEME_FROM_R2)
+print("☁️ ALSO_RETURN_BASE64:", ALSO_RETURN_BASE64)
 
 # --------------------------------------------------
 # GEMINI CONFIG
@@ -124,39 +132,103 @@ async def save_upload_async(file: UploadFile) -> Path:
     return path
 
 
+def _ensure_theme_dir(theme_key: str) -> Path:
+    d = THEMES_ROOT / theme_key
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def ensure_theme_ready(theme_name: str) -> Path:
     """
     Ensures public/themes/<theme>/ exists locally.
-    If R2 enabled, sync from R2.
-    Returns local theme dir path.
+    If SYNC_FULL_THEME_FROM_R2=1 and R2 enabled, sync all files from R2.
     """
     theme_key = normalize_theme_name(theme_name)
-    local_dir = THEMES_ROOT / theme_key
+    local_dir = _ensure_theme_dir(theme_key)
 
-    if getattr(r2_storage, "R2_ENABLED", False):
-        # download from R2 (etag-skip)
+    if getattr(r2_storage, "R2_ENABLED", False) and SYNC_FULL_THEME_FROM_R2:
         sync_theme_to_local(theme_key, THEMES_ROOT)
 
-    local_dir.mkdir(parents=True, exist_ok=True)
     return local_dir
 
 
+def ensure_theme_file_local(theme_key: str, filename: str) -> Path:
+    """
+    Ensure a specific theme file exists locally.
+    If missing and R2 enabled -> download ONLY that file: themes/<theme>/<filename>
+    """
+    theme_dir = _ensure_theme_dir(theme_key)
+    local_path = theme_dir / filename
+    if local_path.exists():
+        return local_path
+
+    if getattr(r2_storage, "R2_ENABLED", False):
+        r2_key = f"themes/{theme_key}/{filename}"
+        try:
+            data = r2_storage.get_bytes(r2_key)
+            local_path.write_bytes(data)
+            return local_path
+        except Exception as e:
+            if SYNC_FULL_THEME_FROM_R2:
+                try:
+                    sync_theme_to_local(theme_key, THEMES_ROOT)
+                    if local_path.exists():
+                        return local_path
+                except Exception:
+                    pass
+            raise RuntimeError(f"Theme file missing and failed to fetch from R2: {r2_key} ({e})")
+
+    raise RuntimeError(f"Theme target not found locally: {local_path} (R2 disabled)")
+
+
+def _upload_to_r2(prefix: str, data: bytes, content_type: str) -> str:
+    """
+    Upload bytes to R2 and return URL. Requires R2_ENABLED.
+    """
+    key = f"{prefix}/{uuid.uuid4().hex}"
+    if content_type == "image/png" and not key.endswith(".png"):
+        key += ".png"
+    if content_type == "image/jpeg" and not (key.endswith(".jpg") or key.endswith(".jpeg")):
+        key += ".jpg"
+    return r2_storage.put_bytes(key, data, content_type=content_type)
+
+
+def _response_image(
+    *,
+    request: Request,
+    image_bytes: bytes,
+    mime: str,
+    extra: dict,
+    r2_prefix: Optional[str] = None,
+):
+    """
+    Standard response for images:
+    - If R2 enabled -> returns imageUrl (+ optional base64 if ALSO_RETURN_BASE64=1)
+    - Else -> returns base64 as 'image'
+    """
+    payload = {**extra, "success": True, "mime": mime}
+
+    if getattr(r2_storage, "R2_ENABLED", False) and r2_prefix:
+        url = _upload_to_r2(r2_prefix, image_bytes, content_type=mime)
+        payload["imageUrl"] = url
+        if ALSO_RETURN_BASE64:
+            payload["image"] = base64.b64encode(image_bytes).decode()
+        return JSONResponse(payload)
+
+    # local/base64 fallback
+    payload["image"] = base64.b64encode(image_bytes).decode()
+    return JSONResponse(payload)
+
+
 def _background_warmup():
-    """
-    Runs warmup without blocking startup.
-    Helps avoid first-request timeouts on Railway.
-    """
     try:
         print("🔥 Background warmup started...")
-
-        # 1) Ensure inswapper exists (from R2 in your swap_engine)
         try:
             if hasattr(swap_engine, "ensure_inswapper_present"):
                 swap_engine.ensure_inswapper_present()
         except Exception as e:
             print("⚠️ Warmup: inswapper preload failed:", e)
 
-        # 2) Warm up InsightFace (downloads buffalo_l) once at boot (if your swap_engine has warmup)
         try:
             if hasattr(swap_engine, "warmup"):
                 swap_engine.warmup()
@@ -169,36 +241,35 @@ def _background_warmup():
 
 
 # --------------------------------------------------
-# STARTUP (keep light!)
+# STARTUP
 # --------------------------------------------------
 @app.on_event("startup")
 def _startup():
-    # Optional theme cache build (can be heavy)
     if os.getenv("BUILD_THEME_CACHE_ON_STARTUP", "0") == "1":
         try:
             ensure_all_theme_caches()
         except Exception as e:
             print("⚠️ ensure_all_theme_caches failed:", e)
 
-    # Non-blocking warmup to reduce first-request timeouts
     if os.getenv("BACKGROUND_WARMUP", "1") == "1":
         threading.Thread(target=_background_warmup, daemon=True).start()
 
 
 # --------------------------------------------------
-# ROOT + HEALTH (Railway-friendly)
+# ROOT + HEALTH
 # --------------------------------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "faceswap-backend"}
-
+    return {
+        "ok": True,
+        "service": "faceswap-backend",
+        "r2Enabled": bool(getattr(r2_storage, "R2_ENABLED", False)),
+    }
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-
-# some proxies hit //health
 @app.get("//health")
 def health_double_slash():
     return {"ok": True}
@@ -223,54 +294,42 @@ async def faceswap(
         print("theme_name:", theme_name)
         print("--------------------------------")
 
-        # -----------------------------
-        # READ + VALIDATE SOURCE
-        # -----------------------------
         source_bytes = await source_img.read()
         validate_image_bytes(source_bytes)
 
-        chosen_target_bytes: bytes | None = None
-        chosen_target_name: str | None = None
-        similarity: float | None = None
-        theme_key: str | None = None
+        chosen_target_bytes: Optional[bytes] = None
+        chosen_target_name: Optional[str] = None
+        similarity: Optional[float] = None
+        theme_key: Optional[str] = None
 
-        # -----------------------------
         # 1) explicit target file
-        # -----------------------------
         if target_img is not None:
             target_bytes = await target_img.read()
             validate_image_bytes(target_bytes)
             chosen_target_bytes = target_bytes
             chosen_target_name = target_img.filename or "uploaded_target"
 
-        # -----------------------------
         # 2) explicit target url
-        # -----------------------------
         elif target_img_url:
             target_bytes = load_image_bytes(target_img_url)
             validate_image_bytes(target_bytes)
             chosen_target_bytes = target_bytes
             chosen_target_name = target_img_url
 
-        # -----------------------------
         # 3) theme flow
-        # -----------------------------
         elif theme_name:
             theme_key = normalize_theme_name(theme_name)
-
-            # Ensure theme files are present locally (from R2 if enabled)
             ensure_theme_ready(theme_key)
 
-            # Get embedding
+            # embedding
             _, face = swap_engine.extract_user_face(source_bytes)
             user_embedding = face.normed_embedding
 
             theme_faces = load_theme_cache(theme_key)
             best_file, similarity = pick_best_theme_image(user_embedding, theme_faces)
-
             print(f"🔍 Theme '{theme_key}' similarity score: {similarity}")
 
-            # Nano Banana fallback (kept)
+            # Nano Banana fallback
             if similarity is not None and similarity < MIN_SIMILARITY:
                 print("⚠️ Low similarity → Nano Banana fallback")
                 try:
@@ -281,37 +340,26 @@ async def faceswap(
                         themes_root=str(THEMES_ROOT),
                     )
 
-                    # Refresh cache (optional)
                     try:
                         rebuild_single_theme_cache(theme_key)
                         clear_theme_cache(theme_key)
                     except Exception:
                         pass
 
-                    # ✅ If R2 enabled, return URL (small JSON) — prevents huge base64 + fixes UI
-                    if getattr(r2_storage, "R2_ENABLED", False):
-                        out_key = f"outputs/faceswap/{theme_key}/{uuid.uuid4().hex}.png"
-                        url = r2_storage.put_bytes(out_key, gen_bytes, content_type="image/png")
-                        return JSONResponse({
-                            "success": True,
+                    return _response_image(
+                        request=request,
+                        image_bytes=gen_bytes,
+                        mime="image/png",
+                        r2_prefix=f"outputs/faceswap/{theme_key}",
+                        extra={
                             "theme": theme_key,
                             "used_target": gen_file,
                             "similarity": similarity,
-                            "mime": "image/png",
-                            "imageUrl": url,
-                        })
-
-                    # Fallback: base64 (kept)
-                    return JSONResponse({
-                        "success": True,
-                        "theme": theme_key,
-                        "used_target": gen_file,
-                        "similarity": similarity,
-                        "mime": "image/png",
-                        "image": base64.b64encode(gen_bytes).decode(),
-                    })
+                        },
+                    )
 
                 except NanoBananaError:
+                    # keep behavior
                     return JSONResponse(
                         status_code=200,
                         content={
@@ -321,10 +369,8 @@ async def faceswap(
                         },
                     )
 
-            target_path = THEMES_ROOT / theme_key / best_file
-            if not target_path.exists():
-                raise RuntimeError(f"Theme target not found locally: {target_path}")
-
+            # IMPORTANT: if best_file is not on disk (e.g. gen_*.png), fetch from R2 on demand
+            target_path = ensure_theme_file_local(theme_key, best_file)
             chosen_target_bytes = target_path.read_bytes()
             chosen_target_name = best_file
 
@@ -338,35 +384,21 @@ async def faceswap(
                 },
             )
 
-        # -----------------------------
         # RUN FACE SWAP
-        # -----------------------------
         result_png = swap_engine.run_face_swap(source_bytes, chosen_target_bytes)
 
-        # ✅ IMPORTANT: Upload to R2 and return URL (small JSON)
-        if getattr(r2_storage, "R2_ENABLED", False):
-            out_theme = theme_key or "custom"
-            out_key = f"outputs/faceswap/{out_theme}/{uuid.uuid4().hex}.png"
-            url = r2_storage.put_bytes(out_key, result_png, content_type="image/png")
-
-            return JSONResponse({
-                "success": True,
+        # Return R2 URL if available (fixes UI)
+        return _response_image(
+            request=request,
+            image_bytes=result_png,
+            mime="image/png",
+            r2_prefix=f"outputs/faceswap/{theme_key or 'custom'}",
+            extra={
                 "theme": theme_key or theme_name,
                 "used_target": chosen_target_name,
                 "similarity": similarity,
-                "mime": "image/png",
-                "imageUrl": url,
-            })
-
-        # fallback: still return base64 if R2 not enabled
-        return JSONResponse({
-            "success": True,
-            "theme": theme_key or theme_name,
-            "used_target": chosen_target_name,
-            "similarity": similarity,
-            "mime": detect_mime(result_png),
-            "image": base64.b64encode(result_png).decode(),
-        })
+            },
+        )
 
     except Exception as e:
         traceback.print_exc()
@@ -390,7 +422,7 @@ async def generate(
         elif faceUrl:
             image_bytes = load_image_bytes(faceUrl)
         else:
-            return JSONResponse(status_code=400, content={"error": "Face image missing"})
+            return JSONResponse(status_code=400, content={"success": False, "error": "Face image missing"})
 
         image_bytes = normalize_image_bytes(image_bytes)
         print("🎨 Gemini image generation started")
@@ -400,7 +432,6 @@ async def generate(
                 "role": "user",
                 "parts": [
                     {"text": prompt[:1000]},
-                    # keep your working logic as-is (your genai client accepts bytes here)
                     {"inline_data": {"mime_type": "image/jpeg", "data": image_bytes}},
                 ],
             }
@@ -426,16 +457,14 @@ async def generate(
         if not output_image:
             raise RuntimeError("No image returned by Gemini")
 
-        out_name = f"{uuid.uuid4()}.jpg"
-
-        # ✅ Best: upload to R2 and return URL
+        # Prefer R2 URL
         if getattr(r2_storage, "R2_ENABLED", False):
-            r2_key = f"outputs/generate/{out_name}"
-            r2_url = r2_storage.put_bytes(r2_key, output_image, content_type="image/jpeg")
-            print("✅ Gemini image uploaded to R2:", r2_url)
-            return {"success": True, "imageUrl": r2_url, "model": "gemini-2.5-flash-image"}
+            url = _upload_to_r2("outputs/generate", output_image, "image/jpeg")
+            print("✅ Gemini image uploaded to R2:", url)
+            return {"success": True, "imageUrl": url, "model": "gemini-2.5-flash-image"}
 
-        # Fallback: save locally and return correct Railway URL
+        # fallback: local file URL
+        out_name = f"{uuid.uuid4()}.jpg"
         out_path = UPLOAD_DIR / out_name
         out_path.write_bytes(output_image)
 
