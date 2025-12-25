@@ -10,6 +10,7 @@ import base64
 import imghdr
 import traceback
 from pathlib import Path
+import threading
 
 import requests
 from PIL import Image
@@ -78,6 +79,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Serve /public/... from absolute PUBLIC_DIR
 app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
 
 
@@ -139,32 +141,72 @@ def ensure_theme_ready(theme_name: str) -> Path:
     return local_dir
 
 
+def _background_warmup():
+    """
+    Runs warmup without blocking startup.
+    Helps avoid first-request timeouts on Railway.
+    """
+    try:
+        print("🔥 Background warmup started...")
+        # 1) Ensure inswapper exists (from R2 in your swap_engine)
+        try:
+            if hasattr(swap_engine, "ensure_inswapper_present"):
+                swap_engine.ensure_inswapper_present()
+        except Exception as e:
+            print("⚠️ Warmup: inswapper preload failed:", e)
+
+        # 2) Warm up InsightFace (downloads buffalo_l) once at boot
+        try:
+            if hasattr(swap_engine, "warmup"):
+                swap_engine.warmup()
+        except Exception as e:
+            print("⚠️ Warmup: swap_engine.warmup failed:", e)
+
+        print("✅ Background warmup done.")
+    except Exception as e:
+        print("⚠️ Background warmup crashed:", e)
+
+
 # --------------------------------------------------
 # STARTUP (keep light!)
 # --------------------------------------------------
 @app.on_event("startup")
 def _startup():
-    # 🚫 Avoid heavy work on Railway
+    # Optional theme cache build (can be heavy)
     if os.getenv("BUILD_THEME_CACHE_ON_STARTUP", "0") == "1":
         try:
             ensure_all_theme_caches()
         except Exception as e:
             print("⚠️ ensure_all_theme_caches failed:", e)
 
-    # Optional preload: downloads inswapper from R2 at boot
+    # Optional preload inswapper at boot
     if os.getenv("PRELOAD_INSWAPPER_ON_STARTUP", "0") == "1":
         try:
-            swap_engine.ensure_inswapper_present()
+            if hasattr(swap_engine, "ensure_inswapper_present"):
+                swap_engine.ensure_inswapper_present()
             print("✅ inswapper_128 ready")
         except Exception as e:
             print("⚠️ inswapper preload failed:", e)
 
+    # Non-blocking warmup to reduce first-request timeouts
+    if os.getenv("BACKGROUND_WARMUP", "1") == "1":
+        threading.Thread(target=_background_warmup, daemon=True).start()
+
 
 # --------------------------------------------------
-# HEALTH
+# ROOT + HEALTH (Railway-friendly)
 # --------------------------------------------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "faceswap-backend"}
+
 @app.get("/health")
 def health():
+    return {"ok": True}
+
+# some proxies hit //health
+@app.get("//health")
+def health_double_slash():
     return {"ok": True}
 
 
@@ -195,6 +237,7 @@ async def faceswap(
         chosen_target_bytes: bytes | None = None
         chosen_target_name: str | None = None
         similarity: float | None = None
+        theme_key: str | None = None
 
         # -----------------------------
         # 1) explicit target file
@@ -293,7 +336,7 @@ async def faceswap(
 
         return JSONResponse({
             "success": True,
-            "theme": theme_name,
+            "theme": theme_key or theme_name,
             "used_target": chosen_target_name,
             "similarity": similarity,
             "mime": detect_mime(result_png),
@@ -361,7 +404,8 @@ async def generate(
         out_path = UPLOAD_DIR / out_name
         out_path.write_bytes(output_image)
 
-        image_url = f"http://localhost:8000/public/uploads/{out_name}"
+        # Note: in production you likely want to return your Railway base URL, not localhost.
+        image_url = f"https://web-production-85c19.up.railway.app/public/uploads/{out_name}"
         print("✅ Gemini image generated:", image_url)
 
         return {"imageUrl": image_url, "model": "gemini-2.5-flash-image"}
