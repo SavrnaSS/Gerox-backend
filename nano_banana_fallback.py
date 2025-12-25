@@ -10,6 +10,11 @@ from google import genai
 from google.genai import types
 from insightface.app import FaceAnalysis
 
+from theme_cache_builder import rebuild_single_theme_cache
+from theme_matcher import clear_theme_cache
+
+import r2_storage
+
 # ==================================================
 # INSIGHTFACE (LOAD ONCE)
 # ==================================================
@@ -147,10 +152,13 @@ TARGET_WIDTH = 1080
 TARGET_HEIGHT = 1350
 
 # ==================================================
-# CUSTOM ERROR
+# CUSTOM ERROR (FIXED)
 # ==================================================
 class NanoBananaError(Exception):
-    pass
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 # ==================================================
 # ADVANCED GENDER DETECTION (HAIR + BEARD)
@@ -239,37 +247,25 @@ def generate_with_nano_banana(
     theme_name: str,
     themes_root: str
 ):
-    # ==================================================
-    # 1️⃣ GENDER DETECTION (FROM ORIGINAL UPLOAD ONLY)
-    # ==================================================
     gender, confidence = detect_gender(original_face_bytes)
     print(f"👤 Gender detected: {gender} (confidence {confidence:.2f})")
 
-    # ==================================================
-    # 2️⃣ BUILD PROMPT (SINGLE SOURCE OF TRUTH)
-    # ==================================================
     prompt = build_prompt(theme_name, gender)
 
-    # ==================================================
-    # 3️⃣ GEMINI CLIENT SETUP
-    # ==================================================
     client = genai.Client(
         api_key=os.environ.get("GEMINI_API_KEY")
     )
 
     model = "gemini-2.5-flash-image"
 
-    # Face image used ONLY as identity reference
+    # Keep your base64 approach to avoid breaking your working behavior
     face_b64 = base64.b64encode(face_bytes).decode("utf-8")
 
     contents = [
         types.Content(
             role="user",
             parts=[
-                # Text prompt
                 types.Part(text=prompt),
-
-                # Identity reference image
                 types.Part(
                     inline_data={
                         "mime_type": "image/png",
@@ -287,9 +283,6 @@ def generate_with_nano_banana(
         max_output_tokens=1024,
     )
 
-    # ==================================================
-    # 4️⃣ IMAGE GENERATION (STREAM SAFE)
-    # ==================================================
     image_bytes = None
 
     try:
@@ -309,19 +302,15 @@ def generate_with_nano_banana(
                     break
 
         if not image_bytes:
-            raise NanoBananaError(
-                code="NO_IMAGE",
-                message="No image returned from Gemini"
-            )
+            raise NanoBananaError("NO_IMAGE", "No image returned from Gemini")
 
+    except NanoBananaError:
+        raise
     except Exception as e:
-        raise NanoBananaError(
-            code="GEMINI_ERROR",
-            message=str(e)
-        )
+        raise NanoBananaError("GEMINI_ERROR", str(e))
 
     # ==================================================
-    # 5️⃣ FORCE EXACT 1080 × 1350 (4:5 PORTRAIT)
+    # FORCE EXACT 1080 × 1350 (4:5 PORTRAIT)
     # ==================================================
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
@@ -330,12 +319,10 @@ def generate_with_nano_banana(
     current_ratio = w / h
 
     if current_ratio > target_ratio:
-        # Too wide → crop width
         new_w = int(h * target_ratio)
         left = (w - new_w) // 2
         img = img.crop((left, 0, left + new_w, h))
     else:
-        # Too tall → crop height
         new_h = int(w / target_ratio)
         top = (h - new_h) // 2
         img = img.crop((0, top, w, top + new_h))
@@ -347,35 +334,37 @@ def generate_with_nano_banana(
     image_bytes = buffer.getvalue()
 
     # ==================================================
-    # 6️⃣ SAVE GENERATED IMAGE INTO THEME FOLDER
+    # SAVE GENERATED IMAGE INTO LOCAL THEME CACHE
     # ==================================================
+    theme_key = normalize_theme_name(theme_name)
     filename = f"gen_{uuid.uuid4().hex}.png"
-    theme_dir = os.path.join(themes_root, theme_name)
+    theme_dir = os.path.join(themes_root, theme_key)
     os.makedirs(theme_dir, exist_ok=True)
 
     save_path = os.path.join(theme_dir, filename)
     with open(save_path, "wb") as f:
         f.write(image_bytes)
 
-    print(f"💾 Saved Nano Banana image → {save_path}")
+    print(f"💾 Saved Nano Banana image (local cache) → {save_path}")
 
     # ==================================================
-    # 7️⃣ 🔥 SAFE CACHE REBUILD (CRITICAL FIX)
+    # UPLOAD GENERATED IMAGE INTO R2 THEMES/<theme>/<file>
     # ==================================================
-    # IMPORTANT:
-    # - DO NOT use build_cache_for_theme here
-    # - Use incremental + safe rebuild
-    # - Never break generation if cache fails
+    if r2_storage.R2_ENABLED:
+        r2_key = f"themes/{theme_key}/{filename}"
+        r2_storage.put_bytes(r2_key, image_bytes, content_type="image/png")
+        print(f"☁️ Uploaded Nano Banana image to R2 → {r2_key}")
+
+    # ==================================================
+    # SAFE CACHE REBUILD (CRITICAL FIX)
+    # ==================================================
     try:
-        print(f"🧠 Rebuilding cache for theme: {theme_name}")
-        rebuild_single_theme_cache(theme_name)
-        clear_theme_cache(theme_name)
+        print(f"🧠 Rebuilding cache for theme: {theme_key}")
+        rebuild_single_theme_cache(theme_key)
+        clear_theme_cache(theme_key)
     except Exception as e:
-        print(f"⚠️ Cache rebuild skipped for {theme_name}: {e}")
+        print(f"⚠️ Cache rebuild skipped for {theme_key}: {e}")
 
-    # ==================================================
-    # 8️⃣ DONE
-    # ==================================================
     print("🍌 Nano Banana → SUCCESS (fully merged & cache-safe)")
 
     return image_bytes, filename

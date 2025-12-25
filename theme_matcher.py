@@ -2,20 +2,43 @@ import os
 import pickle
 import numpy as np
 import random
+from pathlib import Path
 
 # In-memory cache
 THEME_CACHE = {}
+
+# --------------------------------------------------
+# PATHS (robust: works regardless of current working dir)
+# --------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+
+# Use same default as theme_cache_builder.py
+CACHE_DIR = Path(os.getenv("CACHE_DIR", BASE_DIR / "theme_cache"))
+
+# -----------------------------
+# NORMALIZE THEME NAME
+# -----------------------------
+def normalize_theme_name(name: str) -> str:
+    return (
+        (name or "")
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("-", "_")
+    )
 
 # -----------------------------
 # LOAD THEME CACHE
 # -----------------------------
 def load_theme_cache(theme_name: str):
+    theme_name = normalize_theme_name(theme_name)
+
     if theme_name in THEME_CACHE:
         return THEME_CACHE[theme_name]
 
-    cache_path = os.path.join("theme_cache", f"{theme_name}.pkl")
-    if not os.path.exists(cache_path):
-        raise Exception(f"Theme cache not found for theme: {theme_name}")
+    cache_path = CACHE_DIR / f"{theme_name}.pkl"
+    if not cache_path.exists():
+        raise Exception(f"Theme cache not found for theme: {theme_name} ({cache_path})")
 
     with open(cache_path, "rb") as f:
         data = pickle.load(f)
@@ -70,12 +93,12 @@ def pick_best_theme_image(
 
 
 # -----------------------------
-# 🆕 CLEAR IN-MEMORY CACHE
+# CLEAR IN-MEMORY CACHE
 # -----------------------------
 def clear_theme_cache(theme_name: str):
     """
-    Clears in-memory cache for a theme
-    so updated cache is reloaded next time
+    Clears in-memory cache for a theme so updated cache is reloaded next time
     """
+    theme_name = normalize_theme_name(theme_name)
     if theme_name in THEME_CACHE:
         del THEME_CACHE[theme_name]

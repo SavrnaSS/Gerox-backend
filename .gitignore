@@ -17,3 +17,10 @@ gfpgan/weights/
 # caches
 .cache/
 *.log
+
+.theme_cache/
+theme_cache/
+public/uploads/
+.DS_Store
+.env
+.env.local

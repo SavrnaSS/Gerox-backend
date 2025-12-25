@@ -1,11 +1,16 @@
 import os
 import cv2
 import pickle
+from pathlib import Path
 from insightface.app import FaceAnalysis
 
-THEMES_DIR = "public/themes"
-CACHE_DIR = "theme_cache"
+BASE_DIR = Path(__file__).resolve().parent
 
+# ✅ Default to .theme_cache (synced from R2)
+THEMES_DIR = str(Path(os.getenv("THEMES_DIR", BASE_DIR / ".theme_cache")))
+CACHE_DIR = str(Path(os.getenv("CACHE_DIR", BASE_DIR / "theme_cache")))
+
+os.makedirs(THEMES_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ==================================================
@@ -16,7 +21,6 @@ app = FaceAnalysis(
     providers=["CPUExecutionProvider"]
 )
 app.prepare(ctx_id=0, det_size=(640, 640))
-
 
 # ==================================================
 # THEME-AWARE FACE AREA THRESHOLDS
@@ -132,6 +136,7 @@ def build_cache_for_theme(theme_name: str):
 # ENSURE ALL THEME CACHES EXIST
 # ==================================================
 def ensure_all_theme_caches():
+    # If themes dir is empty, this won't do anything (which is fine).
     for theme_name in os.listdir(THEMES_DIR):
         theme_path = os.path.join(THEMES_DIR, theme_name)
         if not os.path.isdir(theme_path):

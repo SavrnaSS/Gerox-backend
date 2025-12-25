@@ -1,15 +1,17 @@
-# cache_theme_embeddings.py
-
 import os
 import cv2
 import pickle
+from pathlib import Path
 from insightface.app import FaceAnalysis
 from tqdm import tqdm
 
-THEMES_DIR = "public/themes"
-CACHE_DIR = "theme_cache"
+BASE_DIR = Path(__file__).resolve().parent
+
+THEMES_DIR = str(Path(os.getenv("THEMES_DIR", BASE_DIR / ".theme_cache")))
+CACHE_DIR = str(Path(os.getenv("CACHE_DIR", BASE_DIR / "theme_cache")))
 MIN_FACE = 40
 
+os.makedirs(THEMES_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 print("🚀 Initializing InsightFace")
