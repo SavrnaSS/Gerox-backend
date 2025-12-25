@@ -1,7 +1,8 @@
 import os
+from pathlib import Path
+
 import cv2
 import numpy as np
-from pathlib import Path
 
 import boto3
 from botocore.config import Config
@@ -10,14 +11,16 @@ from insightface.app import FaceAnalysis
 from insightface.model_zoo import model_zoo
 
 # ==================================================
-# PATHS / CONFIG
+# MODEL PATHS
 # ==================================================
 DEFAULT_INSWAPPER_PATH = Path.home() / ".insightface" / "models" / "inswapper_128.onnx"
 INSWAPPER_PATH = Path(os.getenv("INSWAPPER_PATH", str(DEFAULT_INSWAPPER_PATH)))
 
 INSWAPPER_R2_KEY = os.getenv("INSWAPPER_R2_KEY", "models/inswapper_128.onnx")
 
-# R2 creds (same ones you use for themes)
+# ==================================================
+# R2 CONFIG
+# ==================================================
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
 R2_BUCKET = os.getenv("R2_BUCKET")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
@@ -39,31 +42,28 @@ def _r2_client():
 def ensure_inswapper_present() -> None:
     """
     Ensures inswapper_128.onnx exists on disk.
-    - If missing, downloads from R2 using INSWAPPER_R2_KEY.
+    Downloads from R2 if missing.
     """
     if INSWAPPER_PATH.exists():
         return
 
-    # create folder
     INSWAPPER_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if not R2_ENABLED:
         raise FileNotFoundError(
-            f"inswapper_128.onnx NOT FOUND at {INSWAPPER_PATH} and R2 is not configured.\n"
-            f"Set R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and upload the model to R2.\n"
-            f"Expected key: {INSWAPPER_R2_KEY}"
+            f"inswapper_128.onnx missing at {INSWAPPER_PATH} and R2 not configured.\n"
+            f"Upload to R2 key: {INSWAPPER_R2_KEY} and set R2_* env vars."
         )
 
-    print(f"⬇️ Downloading inswapper model from R2: s3://{R2_BUCKET}/{INSWAPPER_R2_KEY}")
+    print(f"⬇️ Downloading inswapper from R2: s3://{R2_BUCKET}/{INSWAPPER_R2_KEY}")
     s3 = _r2_client()
     s3.download_file(R2_BUCKET, INSWAPPER_R2_KEY, str(INSWAPPER_PATH))
-    print(f"✅ inswapper model saved to: {INSWAPPER_PATH}")
-
+    print(f"✅ inswapper saved: {INSWAPPER_PATH}")
 
 # ==================================================
-# INSIGHTFACE (LAZY LOADING)
+# LAZY SINGLETONS
 # ==================================================
-_face_app: FaceAnalysis | None = None
+_face_app = None
 _swapper = None
 
 def _get_face_app() -> FaceAnalysis:
@@ -82,15 +82,10 @@ def _get_swapper():
         _swapper = model_zoo.get_model(str(INSWAPPER_PATH), providers=["CPUExecutionProvider"])
     return _swapper
 
-
 # ==================================================
-# PUBLIC API (your main.py expects these)
+# PUBLIC API (used by main.py)
 # ==================================================
 def extract_user_face(source_bytes: bytes):
-    """
-    Returns (decoded_image_bgr, best_face)
-    best_face has .normed_embedding used by your theme matcher.
-    """
     img = cv2.imdecode(np.frombuffer(source_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Invalid source image bytes")
@@ -100,18 +95,13 @@ def extract_user_face(source_bytes: bytes):
     if not faces:
         raise ValueError("No face detected in source image")
 
-    # pick largest face
     face = max(
         faces,
         key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
     )
     return img, face
 
-
 def run_face_swap(source_bytes: bytes, target_bytes: bytes) -> bytes:
-    """
-    Returns PNG bytes of swapped target (paste_back=True).
-    """
     src = cv2.imdecode(np.frombuffer(source_bytes, np.uint8), cv2.IMREAD_COLOR)
     tgt = cv2.imdecode(np.frombuffer(target_bytes, np.uint8), cv2.IMREAD_COLOR)
 
@@ -124,7 +114,7 @@ def run_face_swap(source_bytes: bytes, target_bytes: bytes) -> bytes:
     faces_src = app.get(src)
     faces_tgt = app.get(tgt)
 
-    if len(faces_src) == 0 or len(faces_tgt) == 0:
+    if not faces_src or not faces_tgt:
         raise ValueError("Face not detected in one of the images")
 
     face_src = max(

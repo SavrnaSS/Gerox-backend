@@ -1,26 +1,28 @@
 import os
 import cv2
 import pickle
-from pathlib import Path
 from insightface.app import FaceAnalysis
 
-BASE_DIR = Path(__file__).resolve().parent
+THEMES_DIR = "public/themes"
+CACHE_DIR = "theme_cache"
 
-# ✅ Default to .theme_cache (synced from R2)
-THEMES_DIR = str(Path(os.getenv("THEMES_DIR", BASE_DIR / ".theme_cache")))
-CACHE_DIR = str(Path(os.getenv("CACHE_DIR", BASE_DIR / "theme_cache")))
-
-os.makedirs(THEMES_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # ==================================================
-# INSIGHTFACE (LOAD ONCE)
+# INSIGHTFACE (LAZY LOAD)
 # ==================================================
-app = FaceAnalysis(
-    name="buffalo_l",
-    providers=["CPUExecutionProvider"]
-)
-app.prepare(ctx_id=0, det_size=(640, 640))
+_face_app = None
+
+def get_face_app():
+    global _face_app
+    if _face_app is None:
+        print("🧠 Loading InsightFace for cache builder (buffalo_l)...")
+        _face_app = FaceAnalysis(
+            name="buffalo_l",
+            providers=["CPUExecutionProvider"]
+        )
+        _face_app.prepare(ctx_id=0, det_size=(640, 640))
+    return _face_app
 
 # ==================================================
 # THEME-AWARE FACE AREA THRESHOLDS
@@ -34,14 +36,12 @@ THEME_FACE_AREA_THRESHOLD = {
 
 DEFAULT_FACE_AREA_THRESHOLD = 25000
 
-
 def face_area(face):
     x1, y1, x2, y2 = map(int, face.bbox)
     return (x2 - x1) * (y2 - y1)
 
-
 # ==================================================
-# BUILD CACHE FOR ONE THEME (SAFE & SMART)
+# BUILD CACHE FOR ONE THEME
 # ==================================================
 def build_cache_for_theme(theme_name: str):
     theme_path = os.path.join(THEMES_DIR, theme_name)
@@ -58,6 +58,7 @@ def build_cache_for_theme(theme_name: str):
     )
 
     data = []
+    app = get_face_app()
 
     for file in os.listdir(theme_path):
         if not file.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
@@ -78,9 +79,7 @@ def build_cache_for_theme(theme_name: str):
         face = max(faces, key=face_area)
         area = face_area(face)
 
-        # --------------------------------------------------
-        # 🔍 FACE TOO SMALL → TRY ZOOM PASS (CACHE ONLY)
-        # --------------------------------------------------
+        # zoom-rescue pass
         if area < min_area:
             x1, y1, x2, y2 = map(int, face.bbox)
             pad = int(0.6 * max(x2 - x1, y2 - y1))
@@ -100,43 +99,28 @@ def build_cache_for_theme(theme_name: str):
                 area = face_area(face)
 
         if area < min_area:
-            print(
-                f"⚠️ Skipping image (face too small "
-                f"{area} < {min_area}): {file}"
-            )
+            print(f"⚠️ Skipping image (face too small {area} < {min_area}): {file}")
             continue
 
         data.append({
             "file": file,
             "embedding": face.normed_embedding
         })
-
         print(f"✅ Cached face: {file} (area {area})")
 
-    # --------------------------------------------------
-    # 🚫 DO NOT WIPE CACHE IF NOTHING FOUND
-    # --------------------------------------------------
     if not data:
-        print(
-            f"⚠️ No valid faces found for theme: {theme_name} "
-            f"(cache unchanged)"
-        )
+        print(f"⚠️ No valid faces found for theme: {theme_name} (cache unchanged)")
         return
 
     with open(cache_path, "wb") as f:
         pickle.dump(data, f)
 
-    print(
-        f"✅ Rebuilt cache for theme '{theme_name}' "
-        f"with {len(data)} faces"
-    )
-
+    print(f"✅ Rebuilt cache for theme '{theme_name}' with {len(data)} faces")
 
 # ==================================================
 # ENSURE ALL THEME CACHES EXIST
 # ==================================================
 def ensure_all_theme_caches():
-    # If themes dir is empty, this won't do anything (which is fine).
     for theme_name in os.listdir(THEMES_DIR):
         theme_path = os.path.join(THEMES_DIR, theme_name)
         if not os.path.isdir(theme_path):
@@ -147,17 +131,9 @@ def ensure_all_theme_caches():
             print(f"⚠️ Cache missing for '{theme_name}', building…")
             build_cache_for_theme(theme_name)
 
-
 # ==================================================
-# 🔥 REBUILD SINGLE THEME CACHE (NANO BANANA SAFE)
+# REBUILD SINGLE THEME CACHE
 # ==================================================
 def rebuild_single_theme_cache(theme_name: str):
-    """
-    Rebuild cache for ONLY ONE THEME.
-    Used after Nano Banana generation.
-    - Theme-aware face size thresholds
-    - Face zoom rescue for wide shots
-    - Never wipes existing cache
-    """
     print(f"🧠 Rebuilding cache for single theme: {theme_name}")
     build_cache_for_theme(theme_name)

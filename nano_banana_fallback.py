@@ -16,18 +16,24 @@ from theme_matcher import clear_theme_cache
 import r2_storage
 
 # ==================================================
-# INSIGHTFACE (LOAD ONCE)
+# INSIGHTFACE (LAZY LOAD - Railway safe)
 # ==================================================
-print("🧠 Loading InsightFace (gender detection)...")
+_face_app = None
 
-face_app = FaceAnalysis(
-    name="buffalo_l",
-    providers=["CPUExecutionProvider"]
-)
-face_app.prepare(ctx_id=0, det_size=(640, 640))
+def get_face_app():
+    global _face_app
+    if _face_app is None:
+        print("🧠 Loading InsightFace (gender detection)...")
+        _face_app = FaceAnalysis(
+            name="buffalo_l",
+            providers=["CPUExecutionProvider"]
+        )
+        _face_app.prepare(ctx_id=0, det_size=(640, 640))
+    return _face_app
+
 
 # ==================================================
-# THEME NAME NORMALIZER (🔥 CRITICAL FIX)
+# THEME NAME NORMALIZER
 # ==================================================
 def normalize_theme_name(name: str) -> str:
     return (
@@ -57,7 +63,7 @@ SUBJECT_PROMPTS = {
 }
 
 # ==================================================
-# THEME SCENE PROMPTS (NORMALIZED KEYS ONLY)
+# THEME SCENE PROMPTS
 # ==================================================
 THEME_SCENES = {
     "selfie_with_scarlett_johnson": (
@@ -74,72 +80,72 @@ THEME_SCENES = {
     ),
 
     "black_hoddie_portrait": (
-      "Ultra-realistic indoor portrait of the person wearing a black hoodie "
-      "with a red spider-web graphic printed on the chest. "
-      "Relaxed, confident posture with one hand resting casually behind the neck, "
-      "natural candid expression. "
-      "Shot indoors in a cozy bedroom environment, background filled with a collage "
-      "of colorful posters and art prints on the wall. "
-      "Soft cinematic indoor lighting with gentle shadows, realistic skin texture, "
-      "natural color grading. "
-      "Shallow depth of field with a slightly blurred background and sharp focus on the face. "
-      "DSLR camera look, eye-level angle, 50mm lens feel, high dynamic range, "
-      "ultra-detailed, photorealistic, modern lifestyle portrait, no over-stylization."
+        "Ultra-realistic indoor portrait of the person wearing a black hoodie "
+        "with a red spider-web graphic printed on the chest. "
+        "Relaxed, confident posture with one hand resting casually behind the neck, "
+        "natural candid expression. "
+        "Shot indoors in a cozy bedroom environment, background filled with a collage "
+        "of colorful posters and art prints on the wall. "
+        "Soft cinematic indoor lighting with gentle shadows, realistic skin texture, "
+        "natural color grading. "
+        "Shallow depth of field with a slightly blurred background and sharp focus on the face. "
+        "DSLR camera look, eye-level angle, 50mm lens feel, high dynamic range, "
+        "ultra-detailed, photorealistic, modern lifestyle portrait, no over-stylization."
     ),
 
     "mountian_photoshoot": (
-      "Highly realistic lifestyle portrait of the person sitting casually on a concrete "
-      "roadside barrier in a mountainous environment. "
-      "Wearing a light blue open button-down shirt layered over a plain white t-shirt, "
-      "paired with black pants and clean white sneakers. "
-      "Relaxed seated pose with legs slightly apart, one elbow resting on the knee and "
-      "hand thoughtfully touching the chin, conveying a calm, confident, introspective vibe. "
-      "Accessories include a gold wristwatch and a thin gold bracelet. "
-      "Background features lush green hills and valleys with layered mountains fading into "
-      "the distance beneath a bright, softly clouded sky. "
-      "Natural daylight with soft shadows, cinematic depth of field, and realistic skin texture. "
-      "Shot with a DSLR camera, eye-level angle, centered composition, shallow depth of field, "
-      "ultra-detailed, natural color grading, candid travel lifestyle photography, "
-      "high realism, 4K quality."
+        "Highly realistic lifestyle portrait of the person sitting casually on a concrete "
+        "roadside barrier in a mountainous environment. "
+        "Wearing a light blue open button-down shirt layered over a plain white t-shirt, "
+        "paired with black pants and clean white sneakers. "
+        "Relaxed seated pose with legs slightly apart, one elbow resting on the knee and "
+        "hand thoughtfully touching the chin, conveying a calm, confident, introspective vibe. "
+        "Accessories include a gold wristwatch and a thin gold bracelet. "
+        "Background features lush green hills and valleys with layered mountains fading into "
+        "the distance beneath a bright, softly clouded sky. "
+        "Natural daylight with soft shadows, cinematic depth of field, and realistic skin texture. "
+        "Shot with a DSLR camera, eye-level angle, centered composition, shallow depth of field, "
+        "ultra-detailed, natural color grading, candid travel lifestyle photography, "
+        "high realism, 4K quality."
     ),
 
     "photoshoot_with_bike": (
-      "Ultra-realistic cinematic outdoor lifestyle portrait of the person sitting confidently "
-      "on a vivid green Kawasaki Ninja ZX-4R sports motorcycle on a quiet asphalt road. "
-      "Wearing a bright green and black Kawasaki racing jacket with realistic sponsor patches, "
-      "a plain black t-shirt underneath, black cargo pants, and clean white sneakers. "
-      "The subject is seated upright on the motorcycle with a relaxed yet confident posture, "
-      "hands resting naturally near the handlebars and legs grounded for balance, "
-      "bike centered prominently in the frame. "
-      "The motorcycle features aggressive angular fairings, visible front disc brake, "
-      "racing decals, aerodynamic mirrors, and realistic reflections across the windshield "
-      "and body panels, with headlights turned on emitting a subtle glow. "
-      "Environment is a natural outdoor setting with lush green trees softly blurred in the "
-      "background, shallow depth of field, clean road surface, and no traffic or distractions. "
-      "Natural daylight with soft shadows, balanced highlights, and realistic skin texture. "
-      "Shot using DSLR photography at eye-level angle with centered composition, "
-      "cinematic color grading, bokeh background, ultra-sharp focus on both subject and bike. "
-      "High realism, ultra-detailed, 4K clarity, lifestyle automotive photography style, "
-      "Instagram-ready, no motion blur, no distortion, no visual artifacts."
+        "Ultra-realistic cinematic outdoor lifestyle portrait of the person sitting confidently "
+        "on a vivid green Kawasaki Ninja ZX-4R sports motorcycle on a quiet asphalt road. "
+        "Wearing a bright green and black Kawasaki racing jacket with realistic sponsor patches, "
+        "a plain black t-shirt underneath, black cargo pants, and clean white sneakers. "
+        "The subject is seated upright on the motorcycle with a relaxed yet confident posture, "
+        "hands resting naturally near the handlebars and legs grounded for balance, "
+        "bike centered prominently in the frame. "
+        "The motorcycle features aggressive angular fairings, visible front disc brake, "
+        "racing decals, aerodynamic mirrors, and realistic reflections across the windshield "
+        "and body panels, with headlights turned on emitting a subtle glow. "
+        "Environment is a natural outdoor setting with lush green trees softly blurred in the "
+        "background, shallow depth of field, clean road surface, and no traffic or distractions. "
+        "Natural daylight with soft shadows, balanced highlights, and realistic skin texture. "
+        "Shot using DSLR photography at eye-level angle with centered composition, "
+        "cinematic color grading, bokeh background, ultra-sharp focus on both subject and bike. "
+        "High realism, ultra-detailed, 4K clarity, lifestyle automotive photography style, "
+        "Instagram-ready, no motion blur, no distortion, no visual artifacts."
     ),
 
     "selfie_with_cristiano_ronaldo": (
-      "Ultra-realistic candid selfie scene on a professional football ground, "
-      "captured from a handheld smartphone at arm’s length in selfie mode. "
-      "The person is standing beside Cristiano Ronaldo, smiling naturally while "
-      "taking a spontaneous fan selfie after a match. "
-      "Cristiano Ronaldo is wearing a modern football training kit, with natural skin texture, "
-      "realistic facial details, subtle sweat on the face, authentic hairstyle, "
-      "and light beard stubble. "
-      "Background features green stadium grass, a visible goalpost, and softly blurred "
-      "stadium lights and crowd atmosphere, creating a realistic post-match environment. "
-      "Natural daylight with soft shadows, realistic lighting, true-to-life colors, "
-      "and accurate human proportions. "
-      "Shallow depth of field, DSLR-level photo realism despite smartphone perspective, "
-      "real skin pores, cinematic realism. "
-      "The image should look like a genuine spontaneous fan selfie, not posed or staged. "
-      "Extremely photorealistic, ultra-detailed, 8K quality, no distortion, "
-      "no extra limbs, no blur, no waxy skin, no AI artifacts."
+        "Ultra-realistic candid selfie scene on a professional football ground, "
+        "captured from a handheld smartphone at arm’s length in selfie mode. "
+        "The person is standing beside Cristiano Ronaldo, smiling naturally while "
+        "taking a spontaneous fan selfie after a match. "
+        "Cristiano Ronaldo is wearing a modern football training kit, with natural skin texture, "
+        "realistic facial details, subtle sweat on the face, authentic hairstyle, "
+        "and light beard stubble. "
+        "Background features green stadium grass, a visible goalpost, and softly blurred "
+        "stadium lights and crowd atmosphere, creating a realistic post-match environment. "
+        "Natural daylight with soft shadows, realistic lighting, true-to-life colors, "
+        "and accurate human proportions. "
+        "Shallow depth of field, DSLR-level photo realism despite smartphone perspective, "
+        "real skin pores, cinematic realism. "
+        "The image should look like a genuine spontaneous fan selfie, not posed or staged. "
+        "Extremely photorealistic, ultra-detailed, 8K quality, no distortion, "
+        "no extra limbs, no blur, no waxy skin, no AI artifacts."
     ),
 }
 
@@ -152,7 +158,7 @@ TARGET_WIDTH = 1080
 TARGET_HEIGHT = 1350
 
 # ==================================================
-# CUSTOM ERROR (FIXED)
+# CUSTOM ERROR
 # ==================================================
 class NanoBananaError(Exception):
     def __init__(self, code: str, message: str):
@@ -168,7 +174,7 @@ def detect_gender(face_bytes: bytes):
     if img is None:
         return "neutral", 0.0
 
-    faces = face_app.get(img)
+    faces = get_face_app().get(img)
     if not faces:
         return "neutral", 0.0
 
@@ -211,7 +217,7 @@ def detect_gender(face_bytes: bytes):
     return "neutral", 0.5
 
 # ==================================================
-# PROMPT BUILDER (FIXED)
+# PROMPT BUILDER
 # ==================================================
 def build_prompt(theme: str, gender: str) -> str:
     key = normalize_theme_name(theme)
@@ -242,8 +248,8 @@ Professional DSLR quality.
 # GEMINI NANO BANANA GENERATOR
 # ==================================================
 def generate_with_nano_banana(
-    face_bytes: bytes,              # processed / cropped face (used for generation)
-    original_face_bytes: bytes,     # raw uploaded image (used for gender detection)
+    face_bytes: bytes,
+    original_face_bytes: bytes,
     theme_name: str,
     themes_root: str
 ):
@@ -252,13 +258,9 @@ def generate_with_nano_banana(
 
     prompt = build_prompt(theme_name, gender)
 
-    client = genai.Client(
-        api_key=os.environ.get("GEMINI_API_KEY")
-    )
-
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     model = "gemini-2.5-flash-image"
 
-    # Keep your base64 approach to avoid breaking your working behavior
     face_b64 = base64.b64encode(face_bytes).decode("utf-8")
 
     contents = [
@@ -310,7 +312,7 @@ def generate_with_nano_banana(
         raise NanoBananaError("GEMINI_ERROR", str(e))
 
     # ==================================================
-    # FORCE EXACT 1080 × 1350 (4:5 PORTRAIT)
+    # FORCE EXACT 1080 × 1350
     # ==================================================
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
@@ -350,13 +352,13 @@ def generate_with_nano_banana(
     # ==================================================
     # UPLOAD GENERATED IMAGE INTO R2 THEMES/<theme>/<file>
     # ==================================================
-    if r2_storage.R2_ENABLED:
+    if getattr(r2_storage, "R2_ENABLED", False):
         r2_key = f"themes/{theme_key}/{filename}"
         r2_storage.put_bytes(r2_key, image_bytes, content_type="image/png")
         print(f"☁️ Uploaded Nano Banana image to R2 → {r2_key}")
 
     # ==================================================
-    # SAFE CACHE REBUILD (CRITICAL FIX)
+    # SAFE CACHE REBUILD
     # ==================================================
     try:
         print(f"🧠 Rebuilding cache for theme: {theme_key}")
