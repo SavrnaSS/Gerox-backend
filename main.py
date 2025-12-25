@@ -1,3 +1,4 @@
+# main.py
 print("\n🚨 BACKEND STARTED – EMBEDDING MATCH MODE 🚨")
 
 import warnings
@@ -15,7 +16,7 @@ import threading
 import requests
 from PIL import Image
 
-from fastapi import FastAPI, UploadFile, Form, File, HTTPException
+from fastapi import FastAPI, UploadFile, Form, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -141,6 +142,20 @@ def ensure_theme_ready(theme_name: str) -> Path:
     return local_dir
 
 
+def _public_base_url(request: Request) -> str:
+    """
+    Best-effort public base URL.
+    Priority:
+      1) PUBLIC_BASE_URL env (recommended on Railway)
+      2) request.base_url (requires uvicorn --proxy-headers for correct https)
+    """
+    env_base = (os.getenv("PUBLIC_BASE_URL") or "").strip()
+    if env_base:
+        return env_base.rstrip("/")
+
+    return str(request.base_url).rstrip("/")
+
+
 def _background_warmup():
     """
     Runs warmup without blocking startup.
@@ -148,6 +163,7 @@ def _background_warmup():
     """
     try:
         print("🔥 Background warmup started...")
+
         # 1) Ensure inswapper exists (from R2 in your swap_engine)
         try:
             if hasattr(swap_engine, "ensure_inswapper_present"):
@@ -155,7 +171,7 @@ def _background_warmup():
         except Exception as e:
             print("⚠️ Warmup: inswapper preload failed:", e)
 
-        # 2) Warm up InsightFace (downloads buffalo_l) once at boot
+        # 2) Warm up InsightFace once at boot
         try:
             if hasattr(swap_engine, "warmup"):
                 swap_engine.warmup()
@@ -353,11 +369,15 @@ async def faceswap(
 # --------------------------------------------------
 @app.post("/generate")
 async def generate(
+    request: Request,
     prompt: str = Form(...),
     face: UploadFile | None = File(None),
     faceUrl: str | None = Form(None),
 ):
     try:
+        # -----------------------------
+        # LOAD FACE IMAGE
+        # -----------------------------
         if face:
             local_path = await save_upload_async(face)
             image_bytes = local_path.read_bytes()
@@ -369,6 +389,9 @@ async def generate(
         image_bytes = normalize_image_bytes(image_bytes)
         print("🎨 Gemini image generation started")
 
+        # -----------------------------
+        # BUILD GEMINI CONTENT
+        # -----------------------------
         contents = [
             {
                 "role": "user",
@@ -379,8 +402,10 @@ async def generate(
             }
         ]
 
+        # -----------------------------
+        # STREAM + COLLECT IMAGE
+        # -----------------------------
         output_image = None
-
         for chunk in genai_client.models.generate_content_stream(
             model="gemini-2.5-flash-image",
             contents=contents,
@@ -400,12 +425,30 @@ async def generate(
         if not output_image:
             raise RuntimeError("No image returned by Gemini")
 
+        # -----------------------------
+        # SAVE OUTPUT LOCALLY
+        # -----------------------------
         out_name = f"{uuid.uuid4()}.jpg"
         out_path = UPLOAD_DIR / out_name
         out_path.write_bytes(output_image)
 
-        # Note: in production you likely want to return your Railway base URL, not localhost.
-        image_url = f"https://web-production-85c19.up.railway.app/public/uploads/{out_name}"
+        # -----------------------------
+        # ✅ Return public URL (Railway-safe) OR R2 URL
+        # -----------------------------
+        # Prefer R2 for persistence
+        if getattr(r2_storage, "R2_ENABLED", False):
+            r2_key = f"outputs/generate/{out_name}"
+            r2_url = r2_storage.put_bytes(
+                r2_key,
+                output_image,
+                content_type="image/jpeg",
+            )
+            print("✅ Gemini image uploaded to R2:", r2_url)
+            return {"imageUrl": r2_url, "model": "gemini-2.5-flash-image"}
+
+        # Otherwise serve from this backend (/public/uploads/...)
+        base = _public_base_url(request)
+        image_url = f"{base}/public/uploads/{out_name}"
         print("✅ Gemini image generated:", image_url)
 
         return {"imageUrl": image_url, "model": "gemini-2.5-flash-image"}
