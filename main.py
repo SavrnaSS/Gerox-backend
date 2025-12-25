@@ -22,6 +22,9 @@ from fastapi.staticfiles import StaticFiles
 from google import genai
 
 import swap_engine
+import r2_storage
+from r2_theme_store import sync_theme_to_local, normalize_theme_name
+
 from theme_matcher import (
     load_theme_cache,
     pick_best_theme_image,
@@ -36,28 +39,36 @@ from nano_banana_fallback import (
     NanoBananaError,
 )
 
-# If you have r2 theme sync in main.py already, keep it.
-# (not redefining your existing r2 logic here)
-
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
 MIN_SIMILARITY = 0.20
 
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
 THEMES_ROOT = PUBLIC_DIR / "themes"
-
 UPLOAD_DIR = PUBLIC_DIR / "uploads"
+
+THEMES_ROOT.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 print("📁 BASE_DIR:", BASE_DIR)
 print("📁 PUBLIC_DIR:", PUBLIC_DIR)
 print("📁 THEMES_ROOT:", THEMES_ROOT)
 print("📁 UPLOAD_DIR:", UPLOAD_DIR)
+print("☁️ R2_ENABLED:", getattr(r2_storage, "R2_ENABLED", False))
 
+# --------------------------------------------------
+# GEMINI CONFIG
+# --------------------------------------------------
 if not os.getenv("GEMINI_API_KEY"):
     raise RuntimeError("❌ GEMINI_API_KEY is not set")
 
 genai_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
+# --------------------------------------------------
+# FASTAPI APP
+# --------------------------------------------------
 app = FastAPI()
 
 app.add_middleware(
@@ -69,12 +80,18 @@ app.add_middleware(
 
 app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
 
+
+# --------------------------------------------------
+# UTILS
+# --------------------------------------------------
 def detect_mime(data: bytes) -> str:
     kind = imghdr.what(None, data)
     return "image/png" if kind == "png" else "image/jpeg"
 
+
 def validate_image_bytes(data: bytes) -> None:
     Image.open(io.BytesIO(data)).convert("RGB")
+
 
 def normalize_image_bytes(data: bytes, max_size=768) -> bytes:
     img = Image.open(io.BytesIO(data)).convert("RGB")
@@ -84,6 +101,7 @@ def normalize_image_bytes(data: bytes, max_size=768) -> bytes:
     img.save(out, format="JPEG", quality=92, optimize=True)
     return out.getvalue()
 
+
 def load_image_bytes(path_or_url: str) -> bytes:
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
         r = requests.get(path_or_url, timeout=20)
@@ -91,28 +109,49 @@ def load_image_bytes(path_or_url: str) -> bytes:
         return r.content
     return Path(path_or_url).read_bytes()
 
+
 async def save_upload_async(file: UploadFile) -> Path:
     filename = file.filename or "upload.jpg"
     ext = filename.split(".")[-1].lower()
     if ext not in ["jpg", "jpeg", "png", "webp"]:
         ext = "jpg"
-
     name = f"{uuid.uuid4()}.{ext}"
     path = UPLOAD_DIR / name
     data = await file.read()
     path.write_bytes(data)
     return path
 
+
+def ensure_theme_ready(theme_name: str) -> Path:
+    """
+    Ensures public/themes/<theme>/ exists locally.
+    If R2 enabled, sync from R2.
+    Returns local theme dir path.
+    """
+    theme_key = normalize_theme_name(theme_name)
+    local_dir = THEMES_ROOT / theme_key
+
+    if getattr(r2_storage, "R2_ENABLED", False):
+        # download from R2 (etag-skip)
+        sync_theme_to_local(theme_key, THEMES_ROOT)
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    return local_dir
+
+
+# --------------------------------------------------
+# STARTUP (keep light!)
+# --------------------------------------------------
 @app.on_event("startup")
 def _startup():
-    # 🚫 DO NOT build caches by default on Railway.
+    # 🚫 Avoid heavy work on Railway
     if os.getenv("BUILD_THEME_CACHE_ON_STARTUP", "0") == "1":
         try:
             ensure_all_theme_caches()
         except Exception as e:
             print("⚠️ ensure_all_theme_caches failed:", e)
 
-    # Optional: preload inswapper at startup (usually keep OFF)
+    # Optional preload: downloads inswapper from R2 at boot
     if os.getenv("PRELOAD_INSWAPPER_ON_STARTUP", "0") == "1":
         try:
             swap_engine.ensure_inswapper_present()
@@ -120,10 +159,18 @@ def _startup():
         except Exception as e:
             print("⚠️ inswapper preload failed:", e)
 
+
+# --------------------------------------------------
+# HEALTH
+# --------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
+# --------------------------------------------------
+# FACE SWAP
+# --------------------------------------------------
 @app.post("/faceswap")
 async def faceswap(
     source_img: UploadFile = File(...),
@@ -139,6 +186,9 @@ async def faceswap(
         print("theme_name:", theme_name)
         print("--------------------------------")
 
+        # -----------------------------
+        # READ + VALIDATE SOURCE
+        # -----------------------------
         source_bytes = await source_img.read()
         validate_image_bytes(source_bytes)
 
@@ -146,46 +196,63 @@ async def faceswap(
         chosen_target_name: str | None = None
         similarity: float | None = None
 
+        # -----------------------------
+        # 1) explicit target file
+        # -----------------------------
         if target_img is not None:
             target_bytes = await target_img.read()
             validate_image_bytes(target_bytes)
             chosen_target_bytes = target_bytes
             chosen_target_name = target_img.filename or "uploaded_target"
 
+        # -----------------------------
+        # 2) explicit target url
+        # -----------------------------
         elif target_img_url:
             target_bytes = load_image_bytes(target_img_url)
             validate_image_bytes(target_bytes)
             chosen_target_bytes = target_bytes
             chosen_target_name = target_img_url
 
+        # -----------------------------
+        # 3) theme flow
+        # -----------------------------
         elif theme_name:
-            # Your existing theme flow remains the same:
+            theme_key = normalize_theme_name(theme_name)
+
+            # ✅ Ensure theme files are present locally (from R2 if enabled)
+            ensure_theme_ready(theme_key)
+
+            # Get embedding
             _, face = swap_engine.extract_user_face(source_bytes)
             user_embedding = face.normed_embedding
 
-            theme_faces = load_theme_cache(theme_name)
+            theme_faces = load_theme_cache(theme_key)
             best_file, similarity = pick_best_theme_image(user_embedding, theme_faces)
-            print(f"🔍 Theme '{theme_name}' similarity score: {similarity}")
 
+            print(f"🔍 Theme '{theme_key}' similarity score: {similarity}")
+
+            # Nano Banana fallback
             if similarity is not None and similarity < MIN_SIMILARITY:
                 print("⚠️ Low similarity → Nano Banana fallback")
                 try:
                     gen_bytes, gen_file = generate_with_nano_banana(
                         face_bytes=source_bytes,
                         original_face_bytes=source_bytes,
-                        theme_name=theme_name,
+                        theme_name=theme_key,
                         themes_root=str(THEMES_ROOT),
                     )
 
+                    # Refresh cache (optional)
                     try:
-                        rebuild_single_theme_cache(theme_name)
-                        clear_theme_cache(theme_name)
+                        rebuild_single_theme_cache(theme_key)
+                        clear_theme_cache(theme_key)
                     except Exception:
                         pass
 
                     return JSONResponse({
                         "success": True,
-                        "theme": theme_name,
+                        "theme": theme_key,
                         "used_target": gen_file,
                         "similarity": similarity,
                         "mime": detect_mime(gen_bytes),
@@ -202,11 +269,9 @@ async def faceswap(
                         },
                     )
 
-            # If you now load themes from R2, your existing logic should already
-            # download to local cache. This path is still valid for local themes dir.
-            target_path = THEMES_ROOT / theme_name / best_file
+            target_path = THEMES_ROOT / theme_key / best_file
             if not target_path.exists():
-                raise RuntimeError(f"Theme target not found: {target_path}")
+                raise RuntimeError(f"Theme target not found locally: {target_path}")
 
             chosen_target_bytes = target_path.read_bytes()
             chosen_target_name = best_file
@@ -221,6 +286,9 @@ async def faceswap(
                 },
             )
 
+        # -----------------------------
+        # RUN FACE SWAP
+        # -----------------------------
         result_png = swap_engine.run_face_swap(source_bytes, chosen_target_bytes)
 
         return JSONResponse({
@@ -236,6 +304,10 @@ async def faceswap(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# --------------------------------------------------
+# GENERATE (GEMINI)
+# --------------------------------------------------
 @app.post("/generate")
 async def generate(
     prompt: str = Form(...),

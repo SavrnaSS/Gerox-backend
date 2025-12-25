@@ -5,6 +5,15 @@ import r2_storage
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
+def normalize_theme_name(name: str) -> str:
+    return (
+        name.strip()
+        .lower()
+        .replace(" ", "")
+        .replace("-", "_")
+    )
+
+
 def sync_theme_to_local(theme_name: str, local_root: Path) -> Path:
     """
     Download themes/<theme_name>/* from R2 into local_root/<theme_name>/...
@@ -13,10 +22,10 @@ def sync_theme_to_local(theme_name: str, local_root: Path) -> Path:
     if not r2_storage.R2_ENABLED:
         raise RuntimeError("R2 is not enabled; cannot sync themes from R2")
 
-    theme_name = theme_name.strip().lower()
-    prefix = f"themes/{theme_name}/"
+    theme_key = normalize_theme_name(theme_name)
+    prefix = f"themes/{theme_key}/"
 
-    local_theme_dir = local_root / theme_name
+    local_theme_dir = local_root / theme_key
     local_theme_dir.mkdir(parents=True, exist_ok=True)
 
     keys = r2_storage.list_keys(prefix)

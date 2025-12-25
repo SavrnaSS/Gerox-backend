@@ -4,7 +4,7 @@ import mimetypes
 from typing import Optional
 
 import boto3
-from botocore.client import Config
+from botocore.config import Config  # ✅ correct import
 
 
 def _env(name: str) -> Optional[str]:
@@ -70,11 +70,9 @@ def put_bytes(
         CacheControl=cache_control,
     )
 
-    # Return public URL if configured
     if R2_PUBLIC_BASE_URL:
         return f"{R2_PUBLIC_BASE_URL.rstrip('/')}/{key}"
 
-    # Otherwise return presigned GET (private bucket)
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": R2_BUCKET, "Key": key},
@@ -97,24 +95,26 @@ def list_keys(prefix: str) -> list[str]:
     ensure_r2()
     keys: list[str] = []
     token = None
+
     while True:
         kwargs = {"Bucket": R2_BUCKET, "Prefix": prefix}
         if token:
             kwargs["ContinuationToken"] = token
+
         resp = s3.list_objects_v2(**kwargs)
         for obj in resp.get("Contents", []):
             keys.append(obj["Key"])
+
         if resp.get("IsTruncated"):
             token = resp.get("NextContinuationToken")
         else:
             break
+
     return keys
 
 
 def new_key(folder: str, ext: str) -> str:
     folder = folder.strip("/")
-
     if not ext.startswith("."):
         ext = "." + ext
-
     return f"{folder}/{uuid.uuid4().hex}{ext}"
