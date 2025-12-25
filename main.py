@@ -10,8 +10,8 @@ import uuid
 import base64
 import imghdr
 import traceback
-from pathlib import Path
 import threading
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -24,6 +24,28 @@ from fastapi.staticfiles import StaticFiles
 
 from google import genai
 
+# --------------------------------------------------
+# PATHS (set EARLY so other modules can read env vars)
+# --------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+PUBLIC_DIR = BASE_DIR / "public"
+THEMES_ROOT = PUBLIC_DIR / "themes"
+UPLOAD_DIR = PUBLIC_DIR / "uploads"
+
+THEMES_ROOT.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ✅ Theme cache dir (match /app/theme_cache/...)
+THEME_CACHE_DIR = BASE_DIR / "theme_cache"
+THEME_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ✅ Ensure other modules use the same cache dir unless explicitly overridden
+os.environ.setdefault("CACHE_DIR", str(THEME_CACHE_DIR))
+os.environ.setdefault("THEMES_DIR", str(THEMES_ROOT))
+
+# --------------------------------------------------
+# IMPORTS (after env defaults)
+# --------------------------------------------------
 import swap_engine
 import r2_storage
 from r2_theme_store import sync_theme_to_local, normalize_theme_name
@@ -52,18 +74,6 @@ SYNC_FULL_THEME_FROM_R2 = os.getenv("SYNC_FULL_THEME_FROM_R2", "0") == "1"
 
 # If 1, also return base64 even when R2 is enabled (useful for local dev / debugging).
 ALSO_RETURN_BASE64 = os.getenv("ALSO_RETURN_BASE64", "0") == "1"
-
-BASE_DIR = Path(__file__).resolve().parent
-PUBLIC_DIR = BASE_DIR / "public"
-THEMES_ROOT = PUBLIC_DIR / "themes"
-UPLOAD_DIR = PUBLIC_DIR / "uploads"
-
-THEMES_ROOT.mkdir(parents=True, exist_ok=True)
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-# ✅ Theme cache dir (matches your error path /app/theme_cache/...)
-THEME_CACHE_DIR = BASE_DIR / "theme_cache"
-THEME_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 print("📁 BASE_DIR:", BASE_DIR)
 print("📁 PUBLIC_DIR:", PUBLIC_DIR)
@@ -182,9 +192,36 @@ def ensure_theme_file_local(theme_key: str, filename: str) -> Path:
                         return local_path
                 except Exception:
                     pass
-            raise RuntimeError(f"Theme file missing and failed to fetch from R2: {r2_key} ({e})")
+            raise RuntimeError(
+                f"Theme file missing and failed to fetch from R2: {r2_key} ({e})"
+            )
 
     raise RuntimeError(f"Theme target not found locally: {local_path} (R2 disabled)")
+
+
+def pick_random_theme_file(theme_key: str) -> str:
+    """
+    Fallback when cache is missing/empty: pick any image file from the theme folder.
+    """
+    theme_dir = _ensure_theme_dir(theme_key)
+
+    # If the folder is empty on Railway, attempt a quick sync (non-full sync)
+    if getattr(r2_storage, "R2_ENABLED", False):
+        try:
+            if not any(theme_dir.iterdir()):
+                sync_theme_to_local(theme_key, THEMES_ROOT)
+        except Exception as e:
+            print("⚠️ Fallback sync_theme_to_local failed:", e)
+
+    imgs = [
+        p.name
+        for p in theme_dir.iterdir()
+        if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"]
+    ]
+    if not imgs:
+        raise RuntimeError(f"No images found in theme folder: {theme_key}")
+    import random
+    return random.choice(imgs)
 
 
 def _upload_to_r2(prefix: str, data: bytes, content_type: str) -> str:
@@ -221,7 +258,6 @@ def _response_image(
             payload["image"] = base64.b64encode(image_bytes).decode()
         return JSONResponse(payload)
 
-    # local/base64 fallback
     payload["image"] = base64.b64encode(image_bytes).decode()
     return JSONResponse(payload)
 
@@ -247,7 +283,7 @@ def _background_warmup():
 
 
 # --------------------------------------------------
-# ✅ THEME CACHE AUTO-ENSURE (NEW, fixes Railway cache-missing)
+# ✅ THEME CACHE AUTO-ENSURE (Railway-safe)
 # --------------------------------------------------
 _theme_cache_locks: dict[str, threading.Lock] = {}
 
@@ -265,7 +301,7 @@ def ensure_theme_cache_ready(theme_key: str) -> Path:
     """
     Ensure /app/theme_cache/<theme>.pkl exists.
     Strategy:
-      1) If exists locally -> ok
+      1) If exists locally -> ok (even if empty; we will fallback to random image)
       2) If R2 enabled -> try download prebuilt cache (optional)
       3) Else build locally:
            - make sure theme images exist locally (sync theme from R2)
@@ -278,7 +314,6 @@ def ensure_theme_cache_ready(theme_key: str) -> Path:
 
     lock = _get_theme_lock(theme_key)
     with lock:
-        # double-check after acquiring lock (race safe)
         if cache_path.exists():
             return cache_path
 
@@ -399,20 +434,41 @@ async def faceswap(
         # 3) theme flow
         elif theme_name:
             theme_key = normalize_theme_name(theme_name)
+
+            # ensure theme folder exists (and optionally full-sync if enabled)
             ensure_theme_ready(theme_key)
 
-            # ✅ NEW: ensure cache exists (download/build) before loading
-            ensure_theme_cache_ready(theme_key)
+            # ✅ ensure cache exists (download/build). Cache may be empty; we handle that below.
+            try:
+                ensure_theme_cache_ready(theme_key)
+            except Exception as e:
+                print("⚠️ ensure_theme_cache_ready failed (will fallback to random):", e)
 
             # embedding
             _, face = swap_engine.extract_user_face(source_bytes)
             user_embedding = face.normed_embedding
 
-            theme_faces = load_theme_cache(theme_key)
-            best_file, similarity = pick_best_theme_image(user_embedding, theme_faces)
-            print(f"🔍 Theme '{theme_key}' similarity score: {similarity}")
+            # Try cache match; if empty/missing -> fallback random theme image
+            best_file = None
+            theme_faces = []
+            try:
+                theme_faces = load_theme_cache(theme_key)  # can be [] (allowed)
+            except Exception as e:
+                print("⚠️ load_theme_cache failed (will fallback to random):", e)
+                theme_faces = []
 
-            # Nano Banana fallback
+            if theme_faces:
+                try:
+                    best_file, similarity = pick_best_theme_image(user_embedding, theme_faces)
+                    print(f"🔍 Theme '{theme_key}' similarity score: {similarity}")
+                except Exception as e:
+                    print("⚠️ pick_best_theme_image failed (fallback random):", e)
+                    best_file = None
+                    similarity = None
+            else:
+                print(f"⚠️ Theme cache empty for '{theme_key}' → using random theme image fallback")
+
+            # Nano Banana fallback (only if we actually got a similarity score)
             if similarity is not None and similarity < MIN_SIMILARITY:
                 print("⚠️ Low similarity → Nano Banana fallback")
                 try:
@@ -423,6 +479,7 @@ async def faceswap(
                         themes_root=str(THEMES_ROOT),
                     )
 
+                    # try to rebuild cache after generating new theme images
                     try:
                         rebuild_single_theme_cache(theme_key)
                         clear_theme_cache(theme_key)
@@ -442,7 +499,6 @@ async def faceswap(
                     )
 
                 except NanoBananaError:
-                    # keep behavior
                     return JSONResponse(
                         status_code=200,
                         content={
@@ -452,7 +508,12 @@ async def faceswap(
                         },
                     )
 
-            # IMPORTANT: if best_file is not on disk (e.g. gen_*.png), fetch from R2 on demand
+            # ✅ Final fallback if cache matching didn't select anything
+            if not best_file:
+                best_file = pick_random_theme_file(theme_key)
+                print(f"🎲 Picked random target for '{theme_key}': {best_file}")
+
+            # Ensure target file is local (download single file if needed)
             target_path = ensure_theme_file_local(theme_key, best_file)
             chosen_target_bytes = target_path.read_bytes()
             chosen_target_name = best_file
@@ -470,7 +531,6 @@ async def faceswap(
         # RUN FACE SWAP
         result_png = swap_engine.run_face_swap(source_bytes, chosen_target_bytes)
 
-        # Return R2 URL if available (fixes UI)
         return _response_image(
             request=request,
             image_bytes=result_png,
@@ -505,7 +565,10 @@ async def generate(
         elif faceUrl:
             image_bytes = load_image_bytes(faceUrl)
         else:
-            return JSONResponse(status_code=400, content={"success": False, "error": "Face image missing"})
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Face image missing"},
+            )
 
         image_bytes = normalize_image_bytes(image_bytes)
         print("🎨 Gemini image generation started")
@@ -544,7 +607,11 @@ async def generate(
         if getattr(r2_storage, "R2_ENABLED", False):
             url = _upload_to_r2("outputs/generate", output_image, "image/jpeg")
             print("✅ Gemini image uploaded to R2:", url)
-            return {"success": True, "imageUrl": url, "model": "gemini-2.5-flash-image"}
+            return {
+                "success": True,
+                "imageUrl": url,
+                "model": "gemini-2.5-flash-image",
+            }
 
         # fallback: local file URL
         out_name = f"{uuid.uuid4()}.jpg"
@@ -555,11 +622,19 @@ async def generate(
         image_url = f"{base_url}/public/uploads/{out_name}"
         print("✅ Gemini image generated:", image_url)
 
-        return {"success": True, "imageUrl": image_url, "model": "gemini-2.5-flash-image"}
+        return {
+            "success": True,
+            "imageUrl": image_url,
+            "model": "gemini-2.5-flash-image",
+        }
 
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": "GENERATION_FAILED", "message": str(e)},
+            content={
+                "success": False,
+                "error": "GENERATION_FAILED",
+                "message": str(e),
+            },
         )
