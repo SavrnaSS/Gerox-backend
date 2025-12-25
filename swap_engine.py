@@ -1,7 +1,14 @@
+# swap_engine.py
 import os
-import threading
-import time
 from pathlib import Path
+
+# ==================================================
+# ✅ RAILWAY / CPU STABILITY (prevents thread explosion + reduces RAM spikes)
+# ==================================================
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import cv2
 import numpy as np
@@ -15,7 +22,9 @@ from insightface.model_zoo import model_zoo
 # ==================================================
 # MODEL PATHS
 # ==================================================
-DEFAULT_INSWAPPER_PATH = Path.home() / ".insightface" / "models" / "inswapper_128.onnx"
+DEFAULT_INSWAPPER_PATH = (
+    Path.home() / ".insightface" / "models" / "inswapper_128.onnx"
+)
 INSWAPPER_PATH = Path(os.getenv("INSWAPPER_PATH", str(DEFAULT_INSWAPPER_PATH)))
 
 INSWAPPER_R2_KEY = os.getenv("INSWAPPER_R2_KEY", "models/inswapper_128.onnx")
@@ -59,67 +68,64 @@ def ensure_inswapper_present() -> None:
             f"Upload to R2 key: {INSWAPPER_R2_KEY} and set R2_* env vars."
         )
 
-    print(f"⬇️ Downloading inswapper from R2: s3://{R2_BUCKET}/{INSWAPPER_R2_KEY}", flush=True)
+    print(f"⬇️ Downloading inswapper from R2: s3://{R2_BUCKET}/{INSWAPPER_R2_KEY}")
     s3 = _r2_client()
     s3.download_file(R2_BUCKET, INSWAPPER_R2_KEY, str(INSWAPPER_PATH))
-    print(f"✅ inswapper saved: {INSWAPPER_PATH}", flush=True)
+    print(f"✅ inswapper saved: {INSWAPPER_PATH}")
 
 
 # ==================================================
-# LAZY SINGLETONS (THREAD SAFE)
+# LAZY SINGLETONS
 # ==================================================
-_face_app = None
+_face_app: FaceAnalysis | None = None
 _swapper = None
-_init_lock = threading.Lock()
 
 
 def _get_face_app() -> FaceAnalysis:
+    """
+    Loads InsightFace FaceAnalysis only once.
+    ✅ Optimized for Railway: load only detection + recognition modules.
+    """
     global _face_app
-    if _face_app is not None:
-        return _face_app
+    if _face_app is None:
+        model_name = os.getenv("INSIGHTFACE_MODEL", "buffalo_l")
+        det = int(os.getenv("INSIGHTFACE_DET", "320"))  # 640 -> 320 saves RAM/time
 
-    with _init_lock:
-        if _face_app is not None:
-            return _face_app
-        print("🧠 Loading InsightFace FaceAnalysis (buffalo_l)...", flush=True)
-        _face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-        _face_app.prepare(ctx_id=0, det_size=(640, 640))
-        print("✅ FaceAnalysis ready", flush=True)
-        return _face_app
+        print(
+            f"🧠 Loading InsightFace FaceAnalysis ({model_name}) "
+            f"[modules=detection,recognition] det={det}..."
+        )
+
+        _face_app = FaceAnalysis(
+            name=model_name,
+            providers=["CPUExecutionProvider"],
+            allowed_modules=["detection", "recognition"],
+        )
+        _face_app.prepare(ctx_id=0, det_size=(det, det))
+    return _face_app
 
 
 def _get_swapper():
     global _swapper
-    if _swapper is not None:
-        return _swapper
-
-    with _init_lock:
-        if _swapper is not None:
-            return _swapper
+    if _swapper is None:
         ensure_inswapper_present()
-        print(f"🧠 Loading INSwapper model from: {INSWAPPER_PATH}", flush=True)
-        _swapper = model_zoo.get_model(str(INSWAPPER_PATH), providers=["CPUExecutionProvider"])
-        print("✅ INSwapper ready", flush=True)
-        return _swapper
+        print(f"🧠 Loading INSwapper model from: {INSWAPPER_PATH}")
+        _swapper = model_zoo.get_model(
+            str(INSWAPPER_PATH), providers=["CPUExecutionProvider"]
+        )
+    return _swapper
 
 
-def warmup() -> None:
+# ==================================================
+# ✅ OPTIONAL: WARMUP (called from main.py startup)
+# ==================================================
+def warmup():
     """
-    Preloads models so first /faceswap request doesn't time out on Railway.
-    Safe to call multiple times.
+    Preloads models during startup so first request doesn't time out / spike.
     """
-    t0 = time.perf_counter()
-    try:
-        ensure_inswapper_present()
-    except Exception as e:
-        # keep behavior: raise for missing model if no R2 configured
-        print("⚠️ warmup: ensure_inswapper_present failed:", e, flush=True)
-        raise
-
     _get_face_app()
     _get_swapper()
-    dt = time.perf_counter() - t0
-    print(f"✅ swap_engine warmup complete in {dt:.2f}s", flush=True)
+    print("✅ swap_engine warmup complete")
 
 
 # ==================================================
@@ -137,7 +143,7 @@ def extract_user_face(source_bytes: bytes):
 
     face = max(
         faces,
-        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
     )
     return img, face
 
@@ -160,11 +166,11 @@ def run_face_swap(source_bytes: bytes, target_bytes: bytes) -> bytes:
 
     face_src = max(
         faces_src,
-        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
     )
     face_tgt = max(
         faces_tgt,
-        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
     )
 
     swapped = swapper.get(tgt, face_tgt, face_src, paste_back=True)
