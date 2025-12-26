@@ -9,10 +9,11 @@ import os
 import uuid
 import base64
 import imghdr
+import time
+import random
 import traceback
-import asyncio
 from pathlib import Path
-from typing import Optional, Any, Dict, Iterator
+from typing import Optional, Any, Dict, List, Iterator, Tuple
 
 import requests
 from PIL import Image
@@ -51,13 +52,27 @@ print("☁️ R2_ENABLED:", bool(getattr(r2_storage, "R2_ENABLED", False)))
 # --------------------------------------------------
 # GEMINI CONFIG
 # --------------------------------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
+if not os.getenv("GEMINI_API_KEY"):
     raise RuntimeError("❌ GEMINI_API_KEY is not set")
 
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+genai_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# Primary model (kept for compatibility)
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+
+# Failover list (comma-separated) – best practice for flaky IMAGE_OTHER behavior
+# You can override in Railway env:
+# GEMINI_IMAGE_MODELS="gemini-2.5-flash-image,gemini-3-pro-image-preview"
+GEMINI_IMAGE_MODELS = [
+    m.strip() for m in os.getenv(
+        "GEMINI_IMAGE_MODELS",
+        f"{GEMINI_IMAGE_MODEL},gemini-3-pro-image-preview"
+    ).split(",")
+    if m.strip()
+]
+
 print("🧠 GEMINI_IMAGE_MODEL:", GEMINI_IMAGE_MODEL)
+print("🧠 GEMINI_IMAGE_MODELS:", GEMINI_IMAGE_MODELS)
 
 
 # --------------------------------------------------
@@ -88,7 +103,6 @@ def detect_mime(data: bytes) -> str:
 
 
 def validate_image_bytes(data: bytes) -> None:
-    # throws if invalid
     Image.open(io.BytesIO(data)).convert("RGB")
 
 
@@ -149,15 +163,28 @@ def _response_image(
     return JSONResponse(payload)
 
 
-# --------------------------------------------------
-# GEMINI RESPONSE PARSING (parts + file_data)
-# --------------------------------------------------
+# -------------------------
+# GEMINI RESPONSE PARSING
+# -------------------------
 def _get(obj: Any, key: str, default=None):
     if obj is None:
         return default
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
+    if x is None:
+        return None
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    if isinstance(x, str):
+        try:
+            return base64.b64decode(x)
+        except Exception:
+            return None
+    return None
 
 
 def _iter_parts(obj: Any) -> Iterator[Any]:
@@ -176,15 +203,14 @@ def _iter_parts(obj: Any) -> Iterator[Any]:
                     yield p
 
 
-def _try_download_file_uri(file_uri: str) -> Optional[bytes]:
+def _try_download_file_uri(file_uri: str, api_key: str) -> Optional[bytes]:
     if not file_uri:
         return None
     try:
-        # Try header auth first, then ?key= fallback
-        headers = {"x-goog-api-key": GEMINI_API_KEY}
+        headers = {"x-goog-api-key": api_key}
         r = requests.get(file_uri, headers=headers, timeout=60)
         if r.status_code in (401, 403):
-            r = requests.get(file_uri, params={"key": GEMINI_API_KEY}, timeout=60)
+            r = requests.get(file_uri, params={"key": api_key}, timeout=60)
         r.raise_for_status()
         return r.content
     except Exception as e:
@@ -192,35 +218,31 @@ def _try_download_file_uri(file_uri: str) -> Optional[bytes]:
         return None
 
 
-def _extract_image_bytes(obj: Any) -> Optional[bytes]:
-    """
-    Returns JPEG bytes if possible.
-    """
+def _extract_first_image_bytes(obj: Any, api_key: str) -> Optional[bytes]:
     for part in _iter_parts(obj):
-        # inline_data -> part.as_image()
         inline = _get(part, "inline_data", None)
         if inline is not None:
-            try:
-                img = part.as_image()  # PIL Image
-                out = io.BytesIO()
-                img.convert("RGB").save(out, format="JPEG", quality=92, optimize=True)
-                return out.getvalue()
-            except Exception:
-                pass
+            data = _get(inline, "data", None)
+            b = _maybe_b64_to_bytes(data)
+            if b:
+                return b
 
-        # file_data -> file_uri download
         fdata = _get(part, "file_data", None)
         if fdata is not None:
             file_uri = _get(fdata, "file_uri", None)
-            blob = _try_download_file_uri(file_uri)
+            blob = _try_download_file_uri(file_uri, api_key=api_key)
             if blob:
-                # if it's png/webp, normalize to jpeg
-                try:
-                    return normalize_to_jpeg_bytes(blob, max_size=1536)
-                except Exception:
-                    return blob
-
+                return blob
     return None
+
+
+def _extract_any_text(obj: Any) -> str:
+    texts: List[str] = []
+    for part in _iter_parts(obj):
+        t = _get(part, "text", None)
+        if t:
+            texts.append(str(t))
+    return "\n".join(texts).strip()
 
 
 def _debug_gemini(obj: Any) -> Dict[str, Any]:
@@ -239,24 +261,97 @@ def _debug_gemini(obj: Any) -> Dict[str, Any]:
     for _ in _iter_parts(obj):
         parts_count += 1
 
-    # try detect text
-    has_text = False
-    text_preview = ""
-    for part in _iter_parts(obj):
-        t = _get(part, "text", None)
-        if t:
-            has_text = True
-            text_preview = str(t)[:300]
-            break
+    txt = _extract_any_text(obj)
+    prompt_fb = _get(obj, "prompt_feedback", None)
 
     return {
         "candidates": len(candidates),
         "finish_reasons": finish[:5],
         "finish_messages": finish_msg[:2],
         "parts_count": parts_count,
-        "has_text": has_text,
-        "text_preview": text_preview,
+        "has_text": bool(txt),
+        "text_preview": (txt[:300] + ("..." if len(txt) > 300 else "")) if txt else "",
+        "has_prompt_feedback": bool(prompt_fb),
+        "prompt_feedback": prompt_fb if isinstance(prompt_fb, dict) else None,
     }
+
+
+def _sleep_backoff(attempt: int):
+    # attempt: 1..N
+    base = min(1.5 ** attempt, 8.0)
+    jitter = random.random() * 0.25
+    time.sleep(base + jitter)
+
+
+def _gemini_generate_image_bytes(
+    *,
+    contents: List[types.Content],
+    config: types.GenerateContentConfig,
+    api_key: str,
+    request_tag: str,
+    max_attempts: int = 3,
+) -> Tuple[Optional[bytes], Dict[str, Any]]:
+    """
+    Tries:
+      - multiple models (GEMINI_IMAGE_MODELS)
+      - non-stream first
+      - stream fallback
+      - retries with backoff on IMAGE_OTHER / empty parts
+    """
+    last_debug: Dict[str, Any] = {}
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"🌀 Gemini attempt {attempt}/{max_attempts} [{request_tag}]")
+
+        for model in GEMINI_IMAGE_MODELS:
+            model = model.strip()
+            if not model:
+                continue
+
+            # 1) non-stream
+            try:
+                resp = genai_client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+                img = _extract_first_image_bytes(resp, api_key=api_key)
+                if img:
+                    last_debug = {"model": model, "mode": "non_stream"}
+                    return img, last_debug
+
+                dbg = _debug_gemini(resp)
+                dbg.update({"model": model, "mode": "non_stream"})
+                last_debug = dbg
+                print("⚠️ Gemini non-stream returned no image:", dbg)
+
+            except Exception as e:
+                last_debug = {"model": model, "mode": "non_stream", "exception": str(e)}
+                print("⚠️ Gemini non-stream error:", last_debug)
+
+            # 2) stream fallback
+            try:
+                for chunk in genai_client.models.generate_content_stream(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                ):
+                    img = _extract_first_image_bytes(chunk, api_key=api_key)
+                    if img:
+                        last_debug = {"model": model, "mode": "stream"}
+                        return img, last_debug
+
+                # stream finished but no image
+                last_debug = {"model": model, "mode": "stream", "note": "stream_finished_no_image"}
+                print("⚠️ Gemini stream finished with no image:", last_debug)
+
+            except Exception as e:
+                last_debug = {"model": model, "mode": "stream", "exception": str(e)}
+                print("⚠️ Gemini stream error:", last_debug)
+
+        _sleep_backoff(attempt)
+
+    return None, last_debug
 
 
 # --------------------------------------------------
@@ -268,7 +363,7 @@ def root():
         "ok": True,
         "service": "nano-banana-backend",
         "r2Enabled": bool(getattr(r2_storage, "R2_ENABLED", False)),
-        "model": GEMINI_IMAGE_MODEL,
+        "models": GEMINI_IMAGE_MODELS,
     }
 
 
@@ -283,7 +378,7 @@ def health_double_slash():
 
 
 # --------------------------------------------------
-# /faceswap ✅ Nano Banana MAINSTREAM
+# /faceswap  ✅ Nano Banana MAINSTREAM
 # --------------------------------------------------
 @app.post("/faceswap")
 async def faceswap(
@@ -313,12 +408,17 @@ async def faceswap(
                 original_face_bytes=face_jpeg,
                 theme_name=theme,
                 themes_root=str(THEMES_ROOT),
+                # pass model failover list through env (nano file reads env)
             )
         except NanoBananaError as e:
-            print(f"❌ NANO_BANANA_ERROR: {e.code} - {e.message}")
             return JSONResponse(
                 status_code=500,
-                content={"success": False, "error": e.code, "message": e.message},
+                content={
+                    "success": False,
+                    "error": e.code,
+                    "message": e.message,
+                    "hint": "If this works locally but fails on Railway, try switching Railway region (US/Asia) or check GEMINI_API_KEY access.",
+                },
             )
         except Exception as e:
             traceback.print_exc()
@@ -341,7 +441,7 @@ async def faceswap(
 
 
 # --------------------------------------------------
-# /generate ✅ PIL input + TEXT+IMAGE (Railway-safe)
+# /generate  ✅ Resilient
 # --------------------------------------------------
 @app.post("/generate")
 async def generate(
@@ -350,6 +450,9 @@ async def generate(
     face: UploadFile | None = File(None),
     faceUrl: str | None = Form(None),
 ):
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    request_tag = uuid.uuid4().hex[:8]
+
     try:
         if face:
             local_path = await save_upload_async(face)
@@ -365,76 +468,53 @@ async def generate(
         validate_image_bytes(raw)
 
         image_bytes = normalize_to_jpeg_bytes(raw, max_size=1024)
-        pil_face = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         prompt_str = (prompt or "").strip()
         print("🎨 Gemini image generation started")
         print("🧾 Prompt chars:", len(prompt_str))
-        print("🧾 Prompt preview:", prompt_str[:120])
+        print("🧾 Prompt preview:", prompt_str[:80])
 
-        # ✅ canonical request format
-        contents = [prompt_str[:1500], pil_face]
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(text=prompt_str[:1500]),
+                    types.Part(inline_data={"mime_type": "image/jpeg", "data": image_b64}),
+                ],
+            )
+        ]
 
+        # IMPORTANT: allow TEXT too so model can explain if it can’t produce an image
         config = types.GenerateContentConfig(
-            response_modalities=["TEXT", "IMAGE"],
+            response_modalities=["IMAGE", "TEXT"],
             temperature=float(os.getenv("GEMINI_TEMPERATURE", "0.4")),
             top_p=float(os.getenv("GEMINI_TOP_P", "0.8")),
             max_output_tokens=int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048")),
         )
 
-        output_image = None
-        last_dbg = None
-
-        attempts = int(os.getenv("GEMINI_RETRIES", "3"))
-        for i in range(attempts):
-            print(f"🌀 Gemini attempt {i+1}/{attempts}")
-
-            # 1) non-stream first
-            try:
-                resp = genai_client.models.generate_content(
-                    model=GEMINI_IMAGE_MODEL,
-                    contents=contents,
-                    config=config,
-                )
-                output_image = _extract_image_bytes(resp)
-                if not output_image:
-                    last_dbg = _debug_gemini(resp)
-                    print("⚠️ Gemini non-stream returned no image:", last_dbg)
-            except Exception as e:
-                print("⚠️ Non-stream generate_content failed:", e)
-
-            if output_image:
-                break
-
-            # 2) stream fallback
-            try:
-                for chunk in genai_client.models.generate_content_stream(
-                    model=GEMINI_IMAGE_MODEL,
-                    contents=contents,
-                    config=config,
-                ):
-                    output_image = _extract_image_bytes(chunk)
-                    if output_image:
-                        break
-            except Exception as e:
-                print("⚠️ Stream generate_content_stream failed:", e)
-
-            if output_image:
-                break
-
-            await asyncio.sleep(0.4)
+        output_image, dbg = _gemini_generate_image_bytes(
+            contents=contents,
+            config=config,
+            api_key=api_key,
+            request_tag=request_tag,
+            max_attempts=int(os.getenv("GEMINI_MAX_ATTEMPTS", "3")),
+        )
 
         if not output_image:
-            msg = f"No image returned by Gemini (no inline_data/file_data found) | debug={last_dbg}"
-            raise RuntimeError(msg)
+            msg = (
+                "No image returned by Gemini (no inline_data/file_data found). "
+                "This commonly happens with FinishReason.IMAGE_OTHER (upstream image generation ended without output). "
+                "If local works but Railway fails consistently, change Railway region (US/Asia) and verify your GEMINI_API_KEY has image access."
+            )
+            raise RuntimeError(f"{msg} | debug={dbg}")
 
-        # Prefer R2 URL if enabled
+        # R2 preferred
         if bool(getattr(r2_storage, "R2_ENABLED", False)):
             url = _upload_to_r2("outputs/generate", output_image, "image/jpeg")
             print("✅ Gemini image uploaded to R2:", url)
-            return {"success": True, "imageUrl": url, "model": GEMINI_IMAGE_MODEL}
+            return {"success": True, "imageUrl": url, "modelTried": dbg.get("model"), "engine": "gemini"}
 
-        # local file URL
         out_name = f"{uuid.uuid4().hex}.jpg"
         out_path = UPLOAD_DIR / out_name
         out_path.write_bytes(output_image)
@@ -443,7 +523,7 @@ async def generate(
         image_url = f"{base_url}/public/uploads/{out_name}"
         print("✅ Gemini image generated:", image_url)
 
-        return {"success": True, "imageUrl": image_url, "model": GEMINI_IMAGE_MODEL}
+        return {"success": True, "imageUrl": image_url, "modelTried": dbg.get("model"), "engine": "gemini"}
 
     except Exception as e:
         traceback.print_exc()
