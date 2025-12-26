@@ -11,7 +11,7 @@ import base64
 import imghdr
 import traceback
 from pathlib import Path
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Iterator
 
 import requests
 from PIL import Image
@@ -27,13 +27,14 @@ from google.genai import types
 import r2_storage
 from nano_banana_fallback import generate_with_nano_banana, NanoBananaError
 
+
 # --------------------------------------------------
 # PATHS
 # --------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_DIR = BASE_DIR / "public"
 UPLOAD_DIR = PUBLIC_DIR / "uploads"
-THEMES_ROOT = PUBLIC_DIR / "themes"  # nano banana saves theme outputs here
+THEMES_ROOT = PUBLIC_DIR / "themes"
 
 PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -45,6 +46,7 @@ print("📁 UPLOAD_DIR:", UPLOAD_DIR)
 print("📁 THEMES_ROOT:", THEMES_ROOT)
 print("☁️ R2_ENABLED:", bool(getattr(r2_storage, "R2_ENABLED", False)))
 
+
 # --------------------------------------------------
 # GEMINI CONFIG
 # --------------------------------------------------
@@ -54,6 +56,7 @@ if not os.getenv("GEMINI_API_KEY"):
 genai_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 print("🧠 GEMINI_IMAGE_MODEL:", GEMINI_IMAGE_MODEL)
+
 
 # --------------------------------------------------
 # FASTAPI APP
@@ -68,6 +71,7 @@ app.add_middleware(
 )
 
 app.mount("/public", StaticFiles(directory=str(PUBLIC_DIR)), name="public")
+
 
 # --------------------------------------------------
 # UTILS
@@ -86,11 +90,6 @@ def validate_image_bytes(data: bytes) -> None:
 
 
 def normalize_to_jpeg_bytes(data: bytes, max_size: int = 1024) -> bytes:
-    """
-    Railway-safe:
-    - Converts anything (webp/png/jpg) → JPEG bytes
-    - Keeps size reasonable
-    """
     img = Image.open(io.BytesIO(data)).convert("RGB")
     if max(img.size) > max_size:
         img.thumbnail((max_size, max_size))
@@ -147,10 +146,18 @@ def _response_image(
     return JSONResponse(payload)
 
 
+# -------------------------
+# GEMINI RESPONSE PARSING
+# -------------------------
+def _get(obj: Any, key: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
-    """
-    Handles Gemini SDK returning bytes OR base64 string.
-    """
     if x is None:
         return None
     if isinstance(x, (bytes, bytearray)):
@@ -163,66 +170,79 @@ def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
     return None
 
 
-def _iter_parts_from_any(obj: Any):
-    """
-    Yield parts from:
-      - response.parts (official docs)
-      - response.candidates[].content.parts
-      - stream chunk candidates
-    """
-    # 1) response.parts
-    parts = getattr(obj, "parts", None)
+def _iter_parts(obj: Any) -> Iterator[Any]:
+    # response.parts (some SDKs)
+    parts = _get(obj, "parts", None)
     if parts:
         for p in parts:
             yield p
 
-    # 2) candidates -> content -> parts
-    candidates = getattr(obj, "candidates", None)
+    # response.candidates[].content.parts
+    candidates = _get(obj, "candidates", None)
     if candidates:
         for cand in candidates:
-            content = getattr(cand, "content", None)
-            cparts = getattr(content, "parts", None) if content else None
+            content = _get(cand, "content", None)
+            cparts = _get(content, "parts", None) if content else None
             if cparts:
                 for p in cparts:
                     yield p
 
 
+def _try_download_file_uri(file_uri: str) -> Optional[bytes]:
+    if not file_uri:
+        return None
+    try:
+        r = requests.get(file_uri, timeout=60)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        print("⚠️ Failed to download file_uri:", file_uri, "|", e)
+        return None
+
+
 def _extract_first_image_bytes(obj: Any) -> Optional[bytes]:
-    for part in _iter_parts_from_any(obj):
-        inline = getattr(part, "inline_data", None)
+    for part in _iter_parts(obj):
+        # 1) inline_data (dict OR object)
+        inline = _get(part, "inline_data", None)
         if inline is not None:
-            data = getattr(inline, "data", None)
+            data = _get(inline, "data", None)
             b = _maybe_b64_to_bytes(data)
             if b:
                 return b
+
+        # 2) file_data (dict OR object) -> file_uri
+        fdata = _get(part, "file_data", None)
+        if fdata is not None:
+            file_uri = _get(fdata, "file_uri", None)
+            blob = _try_download_file_uri(file_uri)
+            if blob:
+                return blob
+
     return None
 
 
-def _extract_any_text(obj: Any) -> str:
-    texts: List[str] = []
-    for part in _iter_parts_from_any(obj):
-        t = getattr(part, "text", None)
-        if t:
-            texts.append(str(t))
-    return "\n".join(texts).strip()
-
-
 def _debug_gemini(obj: Any) -> Dict[str, Any]:
-    """
-    Prints a minimal debug snapshot without crashing.
-    """
-    candidates = getattr(obj, "candidates", None) or []
+    candidates = _get(obj, "candidates", None) or []
     finish = []
+    finish_msg = []
     for c in candidates:
-        fr = getattr(c, "finish_reason", None)
+        fr = _get(c, "finish_reason", None)
+        fm = _get(c, "finish_message", None)
         if fr is not None:
             finish.append(str(fr))
-    txt = _extract_any_text(obj)
+        if fm:
+            finish_msg.append(str(fm))
+
+    # count parts
+    parts_count = 0
+    for _ in _iter_parts(obj):
+        parts_count += 1
+
     return {
         "candidates": len(candidates),
         "finish_reasons": finish[:5],
-        "has_text": bool(txt),
-        "text_preview": (txt[:300] + ("..." if len(txt) > 300 else "")) if txt else "",
+        "finish_messages": finish_msg[:2],
+        "parts_count": parts_count,
     }
 
 
@@ -250,14 +270,13 @@ def health_double_slash():
 
 
 # --------------------------------------------------
-# /faceswap ✅ Nano Banana MAINSTREAM
+# /faceswap  ✅ Nano Banana MAINSTREAM
 # --------------------------------------------------
 @app.post("/faceswap")
 async def faceswap(
     request: Request,
     source_img: UploadFile = File(...),
     theme_name: str | None = Form(None),
-    # kept only for frontend compatibility
     target_img: UploadFile | None = File(None),
     target_img_url: str | None = Form(None),
 ):
@@ -272,9 +291,7 @@ async def faceswap(
         raw_bytes = await source_img.read()
         validate_image_bytes(raw_bytes)
 
-        # force jpeg before passing down
         face_jpeg = normalize_to_jpeg_bytes(raw_bytes, max_size=1024)
-
         theme = (theme_name or "default").strip()
 
         try:
@@ -288,6 +305,12 @@ async def faceswap(
             return JSONResponse(
                 status_code=500,
                 content={"success": False, "error": e.code, "message": e.message},
+            )
+        except Exception as e:
+            traceback.print_exc()
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": "NANO_BANANA_FAILED", "message": str(e)},
             )
 
         return _response_image(
@@ -304,9 +327,7 @@ async def faceswap(
 
 
 # --------------------------------------------------
-# /generate ✅ FIXED FOR RAILWAY
-#   - send inline_data as BASE64 string (same style as nano_banana_fallback)
-#   - parse response via response.parts OR candidates
+# /generate  ✅ Railway-safe parsing (dict inline_data)
 # --------------------------------------------------
 @app.post("/generate")
 async def generate(
@@ -322,14 +343,10 @@ async def generate(
         elif faceUrl:
             raw = load_image_bytes(faceUrl)
         else:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": "Face image missing"},
-            )
+            return JSONResponse(status_code=400, content={"success": False, "error": "Face image missing"})
 
         validate_image_bytes(raw)
 
-        # normalize to jpeg
         image_bytes = normalize_to_jpeg_bytes(raw, max_size=1024)
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -342,13 +359,8 @@ async def generate(
                 role="user",
                 parts=[
                     types.Part(text=prompt_str[:1500]),
-                    # ✅ IMPORTANT: base64 string in inline_data (Railway-stable)
-                    types.Part(
-                        inline_data={
-                            "mime_type": "image/jpeg",
-                            "data": image_b64,
-                        }
-                    ),
+                    # send as dict (stable everywhere)
+                    types.Part(inline_data={"mime_type": "image/jpeg", "data": image_b64}),
                 ],
             )
         ]
@@ -362,7 +374,7 @@ async def generate(
 
         output_image = None
 
-        # 1) non-stream first
+        # Non-stream first
         try:
             resp = genai_client.models.generate_content(
                 model=GEMINI_IMAGE_MODEL,
@@ -371,12 +383,11 @@ async def generate(
             )
             output_image = _extract_first_image_bytes(resp)
             if not output_image:
-                dbg = _debug_gemini(resp)
-                print("⚠️ Gemini non-stream returned no image:", dbg)
+                print("⚠️ Gemini non-stream returned no image:", _debug_gemini(resp))
         except Exception as e:
-            print("⚠️ Non-stream generate_content failed, fallback to stream:", e)
+            print("⚠️ Non-stream generate_content failed:", e)
 
-        # 2) stream fallback
+        # Stream fallback
         if not output_image:
             try:
                 for chunk in genai_client.models.generate_content_stream(
@@ -391,16 +402,15 @@ async def generate(
                 print("⚠️ Stream generate_content_stream failed:", e)
 
         if not output_image:
-            # try to show any returned text (often safety/region/policy responses)
-            raise RuntimeError("No image returned by Gemini (no inline_data found)")
+            raise RuntimeError("No image returned by Gemini (no inline_data/file_data found)")
 
-        # Prefer R2 URL if enabled
+        # R2 preferred
         if bool(getattr(r2_storage, "R2_ENABLED", False)):
             url = _upload_to_r2("outputs/generate", output_image, "image/jpeg")
             print("✅ Gemini image uploaded to R2:", url)
             return {"success": True, "imageUrl": url, "model": GEMINI_IMAGE_MODEL}
 
-        # local file URL
+        # local URL
         out_name = f"{uuid.uuid4().hex}.jpg"
         out_path = UPLOAD_DIR / out_name
         out_path.write_bytes(output_image)
