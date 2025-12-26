@@ -171,13 +171,11 @@ def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
 
 
 def _iter_parts(obj: Any) -> Iterator[Any]:
-    # response.parts (some SDKs)
     parts = _get(obj, "parts", None)
     if parts:
         for p in parts:
             yield p
 
-    # response.candidates[].content.parts
     candidates = _get(obj, "candidates", None)
     if candidates:
         for cand in candidates:
@@ -202,7 +200,6 @@ def _try_download_file_uri(file_uri: str) -> Optional[bytes]:
 
 def _extract_first_image_bytes(obj: Any) -> Optional[bytes]:
     for part in _iter_parts(obj):
-        # 1) inline_data (dict OR object)
         inline = _get(part, "inline_data", None)
         if inline is not None:
             data = _get(inline, "data", None)
@@ -210,14 +207,12 @@ def _extract_first_image_bytes(obj: Any) -> Optional[bytes]:
             if b:
                 return b
 
-        # 2) file_data (dict OR object) -> file_uri
         fdata = _get(part, "file_data", None)
         if fdata is not None:
             file_uri = _get(fdata, "file_uri", None)
             blob = _try_download_file_uri(file_uri)
             if blob:
                 return blob
-
     return None
 
 
@@ -233,7 +228,6 @@ def _debug_gemini(obj: Any) -> Dict[str, Any]:
         if fm:
             finish_msg.append(str(fm))
 
-    # count parts
     parts_count = 0
     for _ in _iter_parts(obj):
         parts_count += 1
@@ -270,7 +264,7 @@ def health_double_slash():
 
 
 # --------------------------------------------------
-# /faceswap  ✅ Nano Banana MAINSTREAM
+# /faceswap ✅ Nano Banana MAINSTREAM
 # --------------------------------------------------
 @app.post("/faceswap")
 async def faceswap(
@@ -302,6 +296,8 @@ async def faceswap(
                 themes_root=str(THEMES_ROOT),
             )
         except NanoBananaError as e:
+            # ✅ IMPORTANT: log real reason on Railway
+            print("❌ NANO_BANANA_ERROR:", e.code, "-", e.message)
             return JSONResponse(
                 status_code=500,
                 content={"success": False, "error": e.code, "message": e.message},
@@ -327,7 +323,7 @@ async def faceswap(
 
 
 # --------------------------------------------------
-# /generate  ✅ Railway-safe parsing (dict inline_data)
+# /generate ✅ Railway-safe parsing (dict inline_data + file_data)
 # --------------------------------------------------
 @app.post("/generate")
 async def generate(
@@ -359,7 +355,6 @@ async def generate(
                 role="user",
                 parts=[
                     types.Part(text=prompt_str[:1500]),
-                    # send as dict (stable everywhere)
                     types.Part(inline_data={"mime_type": "image/jpeg", "data": image_b64}),
                 ],
             )
@@ -404,13 +399,11 @@ async def generate(
         if not output_image:
             raise RuntimeError("No image returned by Gemini (no inline_data/file_data found)")
 
-        # R2 preferred
         if bool(getattr(r2_storage, "R2_ENABLED", False)):
             url = _upload_to_r2("outputs/generate", output_image, "image/jpeg")
             print("✅ Gemini image uploaded to R2:", url)
             return {"success": True, "imageUrl": url, "model": GEMINI_IMAGE_MODEL}
 
-        # local URL
         out_name = f"{uuid.uuid4().hex}.jpg"
         out_path = UPLOAD_DIR / out_name
         out_path.write_bytes(output_image)

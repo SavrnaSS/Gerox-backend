@@ -2,12 +2,11 @@ import os
 import uuid
 import base64
 from io import BytesIO
-from typing import Optional, Any, Iterator
+from typing import Optional, Any, Iterator, Dict
 
 from PIL import Image
 from google import genai
 from google.genai import types
-
 
 # ==================================================
 # FEATURE FLAGS (Railway-safe defaults)
@@ -18,11 +17,14 @@ NANO_BANANA_REBUILD_CACHE = os.getenv("NANO_BANANA_REBUILD_CACHE", "0") == "1"
 NANO_BANANA_UPLOAD_R2 = os.getenv("NANO_BANANA_UPLOAD_R2", "0") == "1"
 NANO_BANANA_SAVE_LOCAL = os.getenv("NANO_BANANA_SAVE_LOCAL", "0") == "1"
 
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+
+TARGET_WIDTH = 1080
+TARGET_HEIGHT = 1350
 
 def _log(*args):
     if NANO_BANANA_VERBOSE:
         print(*args)
-
 
 # OPTIONAL IMPORTS
 if NANO_BANANA_GENDER_DETECT:
@@ -37,12 +39,19 @@ if NANO_BANANA_REBUILD_CACHE:
     from theme_cache_builder import rebuild_single_theme_cache
     from theme_matcher import clear_theme_cache
 
+# ==================================================
+# CUSTOM ERROR
+# ==================================================
+class NanoBananaError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 # ==================================================
 # INSIGHTFACE (LAZY LOAD)
 # ==================================================
 _face_app = None
-
 
 def get_face_app():
     global _face_app
@@ -54,16 +63,14 @@ def get_face_app():
         _face_app.prepare(ctx_id=0, det_size=(640, 640))
     return _face_app
 
-
 # ==================================================
-# NORMALIZER
+# THEME NAME NORMALIZER
 # ==================================================
 def normalize_theme_name(name: str) -> str:
     return ((name or "").strip().lower().replace(" ", "").replace("-", "_"))
 
-
 # ==================================================
-# PROMPTS
+# SUBJECT PROMPTS
 # ==================================================
 SUBJECT_PROMPTS = {
     "male": (
@@ -79,6 +86,9 @@ SUBJECT_PROMPTS = {
     "neutral": "Face must closely match the provided identity reference.",
 }
 
+# ==================================================
+# THEME SCENES
+# ==================================================
 THEME_SCENES = {
     "selfie_with_scarlett_johnson": (
         "Taking a close-up selfie with Scarlett Johansson on an active movie set. "
@@ -160,18 +170,20 @@ THEME_SCENES = {
 }
 
 DEFAULT_PROMPT = "Ultra realistic portrait photograph. DSLR quality, natural lighting."
-TARGET_WIDTH = 1080
-TARGET_HEIGHT = 1350
-GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
+# If Gemini blocks celeb names, we retry with a safe generic version.
+CELEB_RETRY_REPLACEMENTS: Dict[str, Dict[str, str]] = {
+    "selfie_with_cristiano_ronaldo": {
+        "Cristiano Ronaldo": "a world-famous football star",
+    },
+    "selfie_with_scarlett_johnson": {
+        "Scarlett Johansson": "a famous Hollywood actress",
+    },
+}
 
-class NanoBananaError(Exception):
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-
-
+# ==================================================
+# OPTIONAL GENDER DETECT
+# ==================================================
 def detect_gender(face_bytes: bytes):
     if not NANO_BANANA_GENDER_DETECT:
         return "neutral", 0.0
@@ -223,13 +235,73 @@ def detect_gender(face_bytes: bytes):
 
     return "neutral", 0.5
 
+# ==================================================
+# Robust parsing helpers (dict OR object)
+# ==================================================
+def _get(obj: Any, key: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
-def build_prompt(theme: str, gender: str) -> str:
+def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
+    if x is None:
+        return None
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    if isinstance(x, str):
+        try:
+            return base64.b64decode(x)
+        except Exception:
+            return None
+    return None
+
+def _iter_parts(chunk: Any) -> Iterator[Any]:
+    candidates = _get(chunk, "candidates", None) or []
+    for cand in candidates:
+        content = _get(cand, "content", None)
+        parts = _get(content, "parts", None) if content else None
+        if parts:
+            for p in parts:
+                yield p
+
+def _extract_first_image_bytes_from_chunk(chunk: Any) -> Optional[bytes]:
+    for part in _iter_parts(chunk):
+        inline = _get(part, "inline_data", None)
+        if inline is not None:
+            data = _get(inline, "data", None)
+            b = _maybe_b64_to_bytes(data)
+            if b:
+                return b
+    return None
+
+def _debug_chunk(chunk: Any) -> Dict[str, Any]:
+    candidates = _get(chunk, "candidates", None) or []
+    fr = []
+    fm = []
+    for c in candidates:
+        frv = _get(c, "finish_reason", None)
+        fmv = _get(c, "finish_message", None)
+        if frv is not None:
+            fr.append(str(frv))
+        if fmv:
+            fm.append(str(fmv))
+    return {"candidates": len(candidates), "finish_reasons": fr[:3], "finish_messages": fm[:2]}
+
+# ==================================================
+# PROMPT BUILDER
+# ==================================================
+def build_prompt(theme: str, gender: str, *, allow_celeb_names: bool = True) -> str:
     key = normalize_theme_name(theme)
     scene = THEME_SCENES.get(key)
     if not scene:
         _log(f"⚠️ No scene prompt found for theme: {key}")
         return DEFAULT_PROMPT
+
+    if not allow_celeb_names and key in CELEB_RETRY_REPLACEMENTS:
+        for a, b in CELEB_RETRY_REPLACEMENTS[key].items():
+            scene = scene.replace(a, b)
 
     _log(f"✅ Using scene prompt: {key}")
     subject = SUBJECT_PROMPTS.get(gender, SUBJECT_PROMPTS["neutral"])
@@ -245,73 +317,12 @@ Do not change facial identity.
 Generate a highly realistic portrait photo.
 Aspect ratio 4:5 (portrait).
 Professional DSLR quality.
-"""
+""".strip()
 
-
-# -------------------------
-# Robust parsing (dict OR object)
-# -------------------------
-def _get(obj: Any, key: str, default=None):
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
-def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
-    if x is None:
-        return None
-    if isinstance(x, (bytes, bytearray)):
-        return bytes(x)
-    if isinstance(x, str):
-        try:
-            return base64.b64decode(x)
-        except Exception:
-            return None
-    return None
-
-
-def _iter_parts(chunk: Any) -> Iterator[Any]:
-    candidates = _get(chunk, "candidates", None) or []
-    for cand in candidates:
-        content = _get(cand, "content", None)
-        parts = _get(content, "parts", None) if content else None
-        if parts:
-            for p in parts:
-                yield p
-
-
-def _extract_first_image_bytes_from_chunk(chunk: Any) -> Optional[bytes]:
-    for part in _iter_parts(chunk):
-        inline = _get(part, "inline_data", None)
-        if inline is not None:
-            data = _get(inline, "data", None)
-            b = _maybe_b64_to_bytes(data)
-            if b:
-                return b
-    return None
-
-
-def generate_with_nano_banana(
-    face_bytes: bytes,
-    original_face_bytes: bytes,
-    theme_name: str,
-    themes_root: str,
-):
-    gender, confidence = detect_gender(original_face_bytes)
-    _log(f"👤 Gender detected: {gender} (confidence {confidence:.2f})")
-
-    prompt = build_prompt(theme_name, gender)
-
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise NanoBananaError("NO_API_KEY", "GEMINI_API_KEY is not set")
-
-    client = genai.Client(api_key=api_key)
-
-    face_b64 = base64.b64encode(face_bytes).decode("utf-8")
-
+# ==================================================
+# GEMINI CALL (shared)
+# ==================================================
+def _call_gemini_for_image(client: genai.Client, prompt: str, face_b64: str) -> Optional[bytes]:
     contents = [
         types.Content(
             role="user",
@@ -329,27 +340,63 @@ def generate_with_nano_banana(
         max_output_tokens=int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048")),
     )
 
+    # stream only (works well for image)
+    last_dbg = None
     image_bytes = None
 
-    try:
-        for chunk in client.models.generate_content_stream(
-            model=GEMINI_IMAGE_MODEL,
-            contents=contents,
-            config=config,
-        ):
-            image_bytes = _extract_first_image_bytes_from_chunk(chunk)
-            if image_bytes:
-                break
+    for chunk in client.models.generate_content_stream(
+        model=GEMINI_IMAGE_MODEL,
+        contents=contents,
+        config=config,
+    ):
+        last_dbg = _debug_chunk(chunk)
+        image_bytes = _extract_first_image_bytes_from_chunk(chunk)
+        if image_bytes:
+            return image_bytes
 
-        if not image_bytes:
-            raise NanoBananaError("NO_IMAGE", "No image returned from Gemini (no inline_data found)")
+    if last_dbg:
+        _log("⚠️ Gemini returned no image. Debug:", last_dbg)
 
-    except NanoBananaError:
-        raise
-    except Exception as e:
-        raise NanoBananaError("GEMINI_ERROR", str(e))
+    return None
 
-    # Resize/crop to 1080x1350
+# ==================================================
+# MAIN GENERATOR
+# ==================================================
+def generate_with_nano_banana(
+    face_bytes: bytes,
+    original_face_bytes: bytes,
+    theme_name: str,
+    themes_root: str,
+):
+    gender, confidence = detect_gender(original_face_bytes)
+    _log(f"👤 Gender detected: {gender} (confidence {confidence:.2f})")
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise NanoBananaError("NO_API_KEY", "GEMINI_API_KEY is not set")
+
+    client = genai.Client(api_key=api_key)
+
+    face_b64 = base64.b64encode(face_bytes).decode("utf-8")
+
+    # 1) Try with celeb names (original)
+    prompt1 = build_prompt(theme_name, gender, allow_celeb_names=True)
+    image_bytes = _call_gemini_for_image(client, prompt1, face_b64)
+
+    # 2) If blocked / empty, retry with generic celeb wording
+    if not image_bytes:
+        key = normalize_theme_name(theme_name)
+        if key in CELEB_RETRY_REPLACEMENTS:
+            _log("🔁 Retry without celebrity names (Railway-safe)...")
+            prompt2 = build_prompt(theme_name, gender, allow_celeb_names=False)
+            image_bytes = _call_gemini_for_image(client, prompt2, face_b64)
+
+    if not image_bytes:
+        raise NanoBananaError("NO_IMAGE", "No image returned from Gemini (faceswap)")
+
+    # ==================================================
+    # FORCE EXACT 1080 × 1350
+    # ==================================================
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     w, h = img.size
 
@@ -371,6 +418,9 @@ def generate_with_nano_banana(
     img.save(buffer, format="PNG", optimize=True)
     image_bytes = buffer.getvalue()
 
+    # ==================================================
+    # OPTIONAL OUTPUTS
+    # ==================================================
     theme_key = normalize_theme_name(theme_name)
     filename = f"gen_{uuid.uuid4().hex}.png"
 
