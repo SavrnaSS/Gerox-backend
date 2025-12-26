@@ -1,3 +1,4 @@
+# nano_banana_fallback.py
 import os
 import uuid
 import base64
@@ -206,6 +207,22 @@ class NanoBananaError(Exception):
 
 
 # ==================================================
+# IMAGE NORMALIZER (Railway-safe)
+# ==================================================
+def _normalize_to_jpeg_bytes(data: bytes, max_size: int = 1024) -> bytes:
+    """
+    Convert anything (png/webp/jpg) -> JPEG bytes.
+    Helps on Railway where opencv-headless often can't decode WebP.
+    """
+    img = Image.open(BytesIO(data)).convert("RGB")
+    if max(img.size) > max_size:
+        img.thumbnail((max_size, max_size))
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=92, optimize=True)
+    return out.getvalue()
+
+
+# ==================================================
 # ADVANCED GENDER DETECTION (OPTIONAL)
 # ==================================================
 def detect_gender(face_bytes: bytes):
@@ -213,6 +230,13 @@ def detect_gender(face_bytes: bytes):
     If NANO_BANANA_GENDER_DETECT=0, returns neutral immediately (no InsightFace).
     """
     if not NANO_BANANA_GENDER_DETECT:
+        return "neutral", 0.0
+
+    # ✅ normalize first so cv2 decoding works everywhere
+    try:
+        face_bytes = _normalize_to_jpeg_bytes(face_bytes)
+    except Exception:
+        # if PIL can't decode it, fallback to neutral
         return "neutral", 0.0
 
     img = cv2.imdecode(np.frombuffer(face_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -291,7 +315,36 @@ Do not change facial identity.
 Generate a highly realistic portrait photo.
 Aspect ratio 4:5 (portrait).
 Professional DSLR quality.
-"""
+""".strip()
+
+
+# ==================================================
+# GEMINI STREAM PARSER (ROBUST)
+# ==================================================
+def _extract_first_image_from_stream(stream_iter):
+    """
+    Robustly scan ALL candidates + ALL parts for inline image bytes.
+    Fixes Railway cases where image isn't in parts[0].
+    """
+    for chunk in stream_iter:
+        candidates = getattr(chunk, "candidates", None)
+        if not candidates:
+            continue
+
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) if content else None
+            if not parts:
+                continue
+
+            for part in parts:
+                inline = getattr(part, "inline_data", None)
+                if inline is None:
+                    continue
+                data = getattr(inline, "data", None)
+                if data:
+                    return data
+    return None
 
 
 # ==================================================
@@ -303,6 +356,18 @@ def generate_with_nano_banana(
     theme_name: str,
     themes_root: str,
 ):
+    # ✅ normalize inputs (Railway-safe)
+    try:
+        face_bytes = _normalize_to_jpeg_bytes(face_bytes)
+    except Exception as e:
+        raise NanoBananaError("BAD_FACE_IMAGE", f"Face image decode failed: {e}")
+
+    try:
+        original_face_bytes = _normalize_to_jpeg_bytes(original_face_bytes)
+    except Exception:
+        # fallback to face_bytes
+        original_face_bytes = face_bytes
+
     gender, confidence = detect_gender(original_face_bytes)
     _log(f"👤 Gender detected: {gender} (confidence {confidence:.2f})")
 
@@ -315,20 +380,15 @@ def generate_with_nano_banana(
     client = genai.Client(api_key=api_key)
     model = "gemini-2.5-flash-image"
 
-    # Gemini expects base64 string for inline_data.data in this SDK usage
-    face_b64 = base64.b64encode(face_bytes).decode("utf-8")
-
+    # ✅ IMPORTANT:
+    # In google-genai python SDK, inline_data "data" should be BYTES (not base64 string)
+    # when using types.Blob / inline_data models.
     contents = [
         types.Content(
             role="user",
             parts=[
                 types.Part(text=prompt),
-                types.Part(
-                    inline_data={
-                        "mime_type": "image/png",
-                        "data": face_b64,
-                    }
-                ),
+                types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=face_bytes)),
             ],
         )
     ]
@@ -337,26 +397,16 @@ def generate_with_nano_banana(
         response_modalities=["IMAGE"],
         temperature=0.4,
         top_p=0.8,
-        max_output_tokens=1024,
+        max_output_tokens=2048,
     )
 
-    image_bytes = None
-
     try:
-        for chunk in client.models.generate_content_stream(
+        stream = client.models.generate_content_stream(
             model=model,
             contents=contents,
             config=config,
-        ):
-            if (
-                chunk.candidates
-                and chunk.candidates[0].content
-                and chunk.candidates[0].content.parts
-            ):
-                part = chunk.candidates[0].content.parts[0]
-                if part.inline_data and part.inline_data.data:
-                    image_bytes = part.inline_data.data
-                    break
+        )
+        image_bytes = _extract_first_image_from_stream(stream)
 
         if not image_bytes:
             raise NanoBananaError("NO_IMAGE", "No image returned from Gemini")
