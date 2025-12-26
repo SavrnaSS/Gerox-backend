@@ -3,7 +3,9 @@
 venv/
 __pycache__/
 *.pyc
+backup-main.py
 
+backup-swapengine.py
 # models / weights / large binaries
 weights/
 gfpgan/weights/
