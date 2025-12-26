@@ -1,6 +1,7 @@
 import os
 import uuid
 import base64
+import time
 from io import BytesIO
 from typing import Optional, Any, Dict, List, Iterator
 
@@ -13,18 +14,24 @@ from google.genai import types
 # FEATURE FLAGS (Railway-safe defaults)
 # ==================================================
 NANO_BANANA_VERBOSE = os.getenv("NANO_BANANA_VERBOSE", "1") == "1"
-
-# OFF by default -> prevents InsightFace import + model load
 NANO_BANANA_GENDER_DETECT = os.getenv("NANO_BANANA_GENDER_DETECT", "0") == "1"
-
-# OFF by default -> prevents cache rebuild spam
 NANO_BANANA_REBUILD_CACHE = os.getenv("NANO_BANANA_REBUILD_CACHE", "0") == "1"
-
-# OFF by default -> prevents uploading generated images to R2
 NANO_BANANA_UPLOAD_R2 = os.getenv("NANO_BANANA_UPLOAD_R2", "0") == "1"
-
-# OFF by default -> prevents saving generated images into themes_root/<theme>/
 NANO_BANANA_SAVE_LOCAL = os.getenv("NANO_BANANA_SAVE_LOCAL", "0") == "1"
+
+# Gemini reliability knobs (important on Railway)
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+GEMINI_TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.4"))
+GEMINI_TOP_P = float(os.getenv("GEMINI_TOP_P", "0.8"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048"))
+
+GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "3"))
+GEMINI_RETRY_DELAY = float(os.getenv("GEMINI_RETRY_DELAY", "0.9"))  # base seconds
+
+TARGET_WIDTH = 1080
+TARGET_HEIGHT = 1350
+
+DEFAULT_PROMPT = "Ultra realistic portrait photograph. DSLR quality, natural lighting."
 
 
 def _log(*args):
@@ -174,13 +181,6 @@ THEME_SCENES = {
     ),
 }
 
-DEFAULT_PROMPT = "Ultra realistic portrait photograph. DSLR quality, natural lighting."
-
-TARGET_WIDTH = 1080
-TARGET_HEIGHT = 1350
-
-GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
-
 
 # ==================================================
 # CUSTOM ERROR
@@ -272,11 +272,13 @@ def _maybe_b64_to_bytes(x: Any) -> Optional[bytes]:
 
 
 def _iter_parts(obj: Any) -> Iterator[Any]:
+    # response.parts (some SDK variants)
     parts = _get(obj, "parts", None)
     if parts:
         for p in parts:
             yield p
 
+    # response.candidates[].content.parts
     candidates = _get(obj, "candidates", None)
     if candidates:
         for cand in candidates:
@@ -287,23 +289,30 @@ def _iter_parts(obj: Any) -> Iterator[Any]:
                     yield p
 
 
+def _extract_any_text(obj: Any) -> str:
+    texts: List[str] = []
+    for part in _iter_parts(obj):
+        t = _get(part, "text", None)
+        if t:
+            texts.append(str(t))
+    return "\n".join(texts).strip()
+
+
 def _try_download_file_uri(file_uri: str, api_key: str) -> Optional[bytes]:
     if not file_uri:
         return None
+
+    # if Gemini ever returns non-http URIs, requests can't fetch them
+    if not (file_uri.startswith("http://") or file_uri.startswith("https://")):
+        _log("⚠️ file_uri is not http(s); cannot download:", file_uri)
+        return None
+
     try:
-        headers = {}
-        params = {}
-
-        # Some Gemini file_uri require API key in query OR header.
-        # We'll try with header first; if fails, try adding key param.
-        headers["x-goog-api-key"] = api_key
-
-        r = requests.get(file_uri, headers=headers, timeout=60)
-        if r.status_code == 401 or r.status_code == 403:
-            # retry with ?key=
-            params["key"] = api_key
-            r = requests.get(file_uri, params=params, timeout=60)
-
+        # try header first
+        r = requests.get(file_uri, headers={"x-goog-api-key": api_key}, timeout=60)
+        if r.status_code in (401, 403):
+            # retry with key param
+            r = requests.get(file_uri, params={"key": api_key}, timeout=60)
         r.raise_for_status()
         return r.content
     except Exception as e:
@@ -313,6 +322,7 @@ def _try_download_file_uri(file_uri: str, api_key: str) -> Optional[bytes]:
 
 def _extract_first_image_bytes(obj: Any, api_key: str) -> Optional[bytes]:
     for part in _iter_parts(obj):
+        # inline_data
         inline = _get(part, "inline_data", None)
         if inline is not None:
             data = _get(inline, "data", None)
@@ -320,6 +330,7 @@ def _extract_first_image_bytes(obj: Any, api_key: str) -> Optional[bytes]:
             if b:
                 return b
 
+        # file_data -> file_uri
         fdata = _get(part, "file_data", None)
         if fdata is not None:
             file_uri = _get(fdata, "file_uri", None)
@@ -345,11 +356,14 @@ def _debug_gemini(obj: Any) -> Dict[str, Any]:
     for _ in _iter_parts(obj):
         parts_count += 1
 
+    txt = _extract_any_text(obj)
     return {
         "candidates": len(candidates),
         "finish_reasons": finish[:5],
         "finish_messages": finish_msg[:2],
         "parts_count": parts_count,
+        "has_text": bool(txt),
+        "text_preview": (txt[:300] + ("..." if len(txt) > 300 else "")) if txt else "",
     }
 
 
@@ -386,44 +400,70 @@ def generate_with_nano_banana(
         )
     ]
 
+    # ✅ IMPORTANT: include TEXT so we can see why IMAGE failed (Railway)
     config = types.GenerateContentConfig(
-        response_modalities=["IMAGE"],
-        temperature=float(os.getenv("GEMINI_TEMPERATURE", "0.4")),
-        top_p=float(os.getenv("GEMINI_TOP_P", "0.8")),
-        max_output_tokens=int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "2048")),
+        response_modalities=["IMAGE", "TEXT"],
+        temperature=GEMINI_TEMPERATURE,
+        top_p=GEMINI_TOP_P,
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
     )
 
-    image_bytes = None
+    _log("🎨 NanoBanana → Gemini image generation started")
+    _log("🧾 Theme:", normalize_theme_name(theme_name))
+    _log("🧾 Prompt chars:", len(prompt))
+    _log("🧾 Prompt preview:", prompt.strip().replace("\n", " ")[:160])
 
-    # 1) Non-stream first
-    try:
-        resp = client.models.generate_content(
-            model=GEMINI_IMAGE_MODEL,
-            contents=contents,
-            config=config,
-        )
-        image_bytes = _extract_first_image_bytes(resp, api_key=api_key)
-        if not image_bytes:
-            _log("⚠️ NanoBanana non-stream returned no image:", _debug_gemini(resp))
-    except Exception as e:
-        _log("⚠️ NanoBanana non-stream failed, will fallback to stream:", e)
+    image_bytes: Optional[bytes] = None
+    last_dbg: Dict[str, Any] = {}
 
-    # 2) Stream fallback
-    if not image_bytes:
+    # Retry loop: IMAGE_OTHER can be transient on hosted env
+    for attempt in range(1, GEMINI_RETRIES + 1):
+        image_bytes = None
+        _log(f"🌀 NanoBanana attempt {attempt}/{GEMINI_RETRIES}")
+
+        # 1) Non-stream first (often more stable)
         try:
-            for chunk in client.models.generate_content_stream(
+            resp = client.models.generate_content(
                 model=GEMINI_IMAGE_MODEL,
                 contents=contents,
                 config=config,
-            ):
-                image_bytes = _extract_first_image_bytes(chunk, api_key=api_key)
+            )
+            image_bytes = _extract_first_image_bytes(resp, api_key=api_key)
+            last_dbg = _debug_gemini(resp)
+
+            if image_bytes:
+                break
+
+            _log("⚠️ NanoBanana non-stream returned no image:", last_dbg)
+
+        except Exception as e:
+            _log("⚠️ NanoBanana non-stream failed:", e)
+
+        # 2) Stream fallback
+        if not image_bytes:
+            try:
+                for chunk in client.models.generate_content_stream(
+                    model=GEMINI_IMAGE_MODEL,
+                    contents=contents,
+                    config=config,
+                ):
+                    image_bytes = _extract_first_image_bytes(chunk, api_key=api_key)
+                    if image_bytes:
+                        break
+
                 if image_bytes:
                     break
-        except Exception as e:
-            raise NanoBananaError("GEMINI_STREAM_ERROR", str(e))
+
+            except Exception as e:
+                _log("⚠️ NanoBanana stream failed:", e)
+
+        # backoff
+        time.sleep(GEMINI_RETRY_DELAY * attempt)
 
     if not image_bytes:
-        raise NanoBananaError("NO_IMAGE", "No image returned from Gemini (no inline_data/file_data)")
+        # include any text returned (policy/safety/quota messages often show up here)
+        msg = f"No image returned from Gemini (no inline_data/file_data). debug={last_dbg}"
+        raise NanoBananaError("NO_IMAGE", msg)
 
     # ==================================================
     # FORCE EXACT 1080 × 1350
